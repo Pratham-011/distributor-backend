@@ -171,15 +171,21 @@ reportsRouter.get('/purchases', wrap(async (req, res) => {
 }));
 
 // ---------- collections ----------
+// Cash / Cheque / Online split, as columns of a grouped query
+const SPLIT = `count(*)::int n, sum(amount) amount,
+  coalesce(sum(amount) filter (where mode='Cash'),0) cash, count(*) filter (where mode='Cash')::int cash_n,
+  coalesce(sum(amount) filter (where mode='Cheque'),0) cheque, count(*) filter (where mode='Cheque')::int cheque_n,
+  coalesce(sum(amount) filter (where mode='Online'),0) online, count(*) filter (where mode='Online')::int online_n`;
+
 reportsRouter.get('/collections', wrap(async (req, res) => {
   const p = range(req);
   const R = `org_id=$1 and v_date between $2 and $3`;
   const [totals, modes, people, parties, cheques, accounts, daily] = await Promise.all([
     one(`select count(*)::int n, coalesce(sum(amount),0) total from receipts where ${R}`, p),
     q(`select mode name, count(*)::int n, sum(amount) amount from receipts where ${R} group by 1 order by 3 desc`, p),
-    q(`select collected_by name, count(*)::int n, sum(amount) amount from receipts where ${R} group by 1 order by 3 desc`, p),
-    q(`select max(party_name) name, count(*)::int n, sum(amount) amount from receipts where ${R}
-       group by coalesce(party_code, party_name) order by 3 desc limit 20`, p),
+    q(`select collected_by key, collected_by name, ${SPLIT} from receipts where ${R} group by 1 order by sum(amount) desc`, p),
+    q(`select coalesce(party_code, party_name) key, max(party_name) name, max(party_code) code, max(city) city, ${SPLIT}
+       from receipts where ${R} group by 1 order by sum(amount) desc limit 50`, p),
     q(`select v_no, v_date::text date, party_name, bank, cheque_no, cheque_date::text cheque_date, amount from receipts
        where ${R} and mode='Cheque' order by cheque_date nulls last, v_no`, p),
     q(`select account name, count(*)::int n, sum(amount) amount from receipts where ${R} group by 1 order by 3 desc`, p),
@@ -187,6 +193,19 @@ reportsRouter.get('/collections', wrap(async (req, res) => {
   ]);
   const chequeTotal = (await one(`select coalesce(sum(amount),0) v from receipts where ${R} and mode='Cheque'`, p)).v;
   res.json({ totals, modes, people, parties, cheques, cheque_total: chequeTotal, accounts, daily });
+}));
+
+// The receipts behind one row of "Collected by" (by=person) or "Shops" (by=party), for the chosen dates
+reportsRouter.get('/collections/receipts', wrap(async (req, res) => {
+  const p = range(req);
+  const key = String(req.query.key ?? '');
+  const col = { person: 'collected_by', party: 'coalesce(party_code, party_name)' }[req.query.by];
+  if (!col || !key) throw new HttpError(400, 'Please choose a person or a shop.');
+  const receipts = await q(`select v_no, v_date::text date, party_name, party_code, collected_by, mode, account, bank, cheque_no,
+      cheque_date::text cheque_date, amount
+    from receipts where org_id=$1 and v_date between $2 and $3 and ${col} = $4
+    order by case mode when 'Cash' then 1 when 'Cheque' then 2 else 3 end, v_date, v_no limit 2000`, [...p, key]);
+  res.json({ receipts });
 }));
 
 // ---------- outstanding ----------
