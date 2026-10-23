@@ -231,7 +231,7 @@ reportsRouter.get('/stock', wrap(async (req, res) => {
 
   const [items, window] = await Promise.all([
     q(`with st as (
-         select sku_code, max(sku_name) name, max(brand) brand, sum(closing_qty) qty,
+         select sku_code, max(sku_name) name, max(brand) brand, sum(closing_qty) qty, max(mrp) mrp,
                 sum(value) / nullif(sum(closing_qty), 0) rate,
                 min(expiry) filter (where closing_qty > 0) expiry,
                 coalesce(sum(closing_qty) filter (where expiry <= $2::date + ${EXPIRY_DAYS}), 0) expiring_qty
@@ -248,16 +248,20 @@ reportsRouter.get('/stock', wrap(async (req, res) => {
          where org_id=$1 and doc_type='sales' and doc_date > $2::date - 30 and doc_date <= $2 group by sku_code),
        pr as (
          select distinct on (sku_code) sku_code, taxable / nullif(qty, 0) rate from doc_lines
-         where org_id=$1 and doc_type='purchase' and qty > 0 and doc_date <= $2 order by sku_code, doc_date desc)
+         where org_id=$1 and doc_type='purchase' and qty > 0 and doc_date <= $2 order by sku_code, doc_date desc),
+       mrp as (   -- latest MRP printed on any sales or purchase line up to "as on"
+         select distinct on (sku_code) sku_code, mrp from doc_lines
+         where org_id=$1 and mrp > 0 and doc_date <= $2 order by sku_code, doc_date desc)
        select coalesce(st.sku_code, mv.sku_code) code, coalesce(st.name, mv.name) name, coalesce(st.brand, mv.brand) brand,
               coalesce(st.qty, 0) opening, coalesce(mv.bought, 0) bought, coalesce(mv.returned_in, 0) returned_in,
               coalesce(mv.sold, 0) sold, coalesce(mv.returned_out, 0) returned_out,
               coalesce(st.qty, 0) + coalesce(mv.bought, 0) + coalesce(mv.returned_in, 0) - coalesce(mv.sold, 0) - coalesce(mv.returned_out, 0) qty,
-              round(coalesce(pr.rate, st.rate), 4) rate, coalesce(s30.qty, 0) sold30,
+              round(coalesce(pr.rate, st.rate), 4) rate, coalesce(mrp.mrp, st.mrp) mrp, coalesce(s30.qty, 0) sold30,
               st.expiry::text expiry, coalesce(st.expiring_qty, 0) expiring_qty
        from st full outer join mv on mv.sku_code = st.sku_code
        left join s30 on s30.sku_code = coalesce(st.sku_code, mv.sku_code)
-       left join pr on pr.sku_code = coalesce(st.sku_code, mv.sku_code)`, p),
+       left join pr on pr.sku_code = coalesce(st.sku_code, mv.sku_code)
+       left join mrp on mrp.sku_code = coalesce(st.sku_code, mv.sku_code)`, p),
     one(`select count(distinct doc_date)::int days from doc_lines where org_id=$1 and doc_type='sales' and doc_date > $2::date - 30 and doc_date <= $2`, p.slice(0, 2)),
   ]);
 
