@@ -73,6 +73,7 @@ const textVal = v => {
 
 /**
  * accept: ids of suggested corrections the person accepted (see `fixes` on issues), e.g. "134:discount".
+ * Memory: body.rows is used up (each raw row is let go once it is converted); body.totals is kept.
  * @returns {{ rows, issues, reconciliation, period, stats, errors:boolean }}
  */
 export function applyMapping(typeKey, body, mapping, { dateFormat = 'DMY', banner = {}, homeState, accept = [] } = {}) {
@@ -89,7 +90,9 @@ export function applyMapping(typeKey, body, mapping, { dateFormat = 'DMY', banne
   const out = [];
   let skipped = [];
 
-  for (const r of body.rows) {
+  for (let i = 0; i < body.rows.length; i++) {
+    const r = body.rows[i];
+    body.rows[i] = null;   // the raw row is not needed again: let it go now rather than at the end
     const rec = { row_no: r._row };
     for (const f of T.fields) if (!mapping[f.key] && !['text', 'date'].includes(f.kind)) rec[f.key] = f.kind === 'int' ? 0 : Z;
     for (const f of fields) {
@@ -169,17 +172,14 @@ export function applyMapping(typeKey, body, mapping, { dateFormat = 'DMY', banne
     }
   }
 
-  // serialise decimals
-  const rows = out.map(r => {
-    const o = {};
-    for (const [k, v] of Object.entries(r)) o[k] = v instanceof Decimal ? v.toFixed() : v;
-    return o;
-  });
   const sumOf = k => out.reduce((a, r) => a.plus(r[k] || Z), Z).toFixed(2);
-  const stats = { rows: rows.length, ...(T.table === 'doc_lines' ? { taxable: sumOf('taxable'), docs: new Set(rows.map(r => r.doc_no)).size }
+  const stats = { rows: out.length, ...(T.table === 'doc_lines' ? { taxable: sumOf('taxable'), docs: new Set(out.map(r => r.doc_no)).size }
     : typeKey === 'receipt' ? { amount: sumOf('amount') }
-      : typeKey === 'stock' ? { items: new Set(rows.map(r => r.sku_code)).size, stock_qty: sumOf('closing_qty'), ...(mapping.value || mapping.rate ? { stock_value: sumOf('value') } : {}) }
+      : typeKey === 'stock' ? { items: new Set(out.map(r => r.sku_code)).size, stock_qty: sumOf('closing_qty'), ...(mapping.value || mapping.rate ? { stock_value: sumOf('value') } : {}) }
         : { balance: sumOf('balance') }) };
+  // decimals -> exact strings for Postgres, in place (a second copy of every row would double the memory)
+  for (const r of out) for (const k in r) if (r[k] instanceof Decimal) r[k] = r[k].toFixed();
+  const rows = out;
   return { rows, issues, reconciliation, period, stats, errors: issues.some(i => i.level === 'error') };
 }
 

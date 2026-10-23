@@ -11,6 +11,7 @@ import { authRouter, usersRouter, orgRouter, OTP_DEMO } from './auth.js';
 import { uploadsRouter, templatesRouter, purgeDeleted } from './routes/uploads.js';
 import { reportsRouter } from './routes/reports.js';
 import { activityRouter } from './routes/activity.js';
+import { platformRouter } from './routes/platform.js';
 import { errorHandler } from './http.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -24,6 +25,7 @@ app.use('/api/auth', authRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/org', orgRouter);
 app.use('/api/activity', activityRouter);
+app.use('/api/platform', platformRouter);
 app.use('/api/uploads', uploadsRouter);
 app.use('/api/templates', templatesRouter);
 app.use('/api/reports', reportsRouter);

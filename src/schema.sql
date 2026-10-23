@@ -202,6 +202,41 @@ create index if not exists stock_upload on stock_items (upload_id);
 -- for "sold per day" and "estimated stock today" on the Stock page
 create index if not exists doc_lines_sku on doc_lines (org_id, sku_code, doc_type, doc_date);
 
+-- ---- platform (you, the software owner): subscription and access per business ----
+alter table organizations add column if not exists status text not null default 'active';   -- active | paused
+alter table organizations add column if not exists status_reason text;
+alter table organizations add column if not exists plan_name text;
+alter table organizations add column if not exists plan_price numeric(12,2);                  -- per billing period
+alter table organizations add column if not exists billing_period text;                       -- monthly | quarterly | half_yearly | yearly | custom
+alter table organizations add column if not exists setup_fee numeric(12,2);                    -- one-time
+alter table organizations add column if not exists period_start date;
+alter table organizations add column if not exists paid_until date;                            -- null = no end date
+alter table organizations add column if not exists auto_off boolean not null default true;     -- block access after paid_until
+alter table organizations add column if not exists billing_notes text;
+create table if not exists org_payments (
+  id          uuid primary key default gen_random_uuid(),
+  org_id      uuid not null references organizations(id) on delete cascade,
+  paid_on     date not null,
+  amount      numeric(12,2) not null,
+  kind        text not null,               -- setup | subscription | other
+  period_from date,
+  period_to   date,
+  note        text,
+  created_by  text,
+  created_at  timestamptz not null default now()
+);
+create index if not exists org_payments_q on org_payments (org_id, paid_on desc);
+-- how much each person uses the app: one "block" = a 5-minute window in which they did something
+alter table users add column if not exists last_seen_at timestamptz;
+create table if not exists usage_blocks (
+  user_id  uuid not null references users(id) on delete cascade,
+  org_id   uuid not null references organizations(id) on delete cascade,
+  day      date not null,
+  blocks   int not null default 0,
+  primary key (user_id, day)
+);
+create index if not exists usage_blocks_q on usage_blocks (org_id, day);
+
 -- everything people do in the app, newest first
 create table if not exists activity_log (
   id          bigserial primary key,
@@ -229,3 +264,5 @@ alter table receipts          enable row level security;
 alter table outstanding_bills enable row level security;
 alter table activity_log      enable row level security;
 alter table stock_items       enable row level security;
+alter table org_payments      enable row level security;
+alter table usage_blocks      enable row level security;

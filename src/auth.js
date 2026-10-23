@@ -36,11 +36,50 @@ function sign(user) {
   return jwt.sign({ sub: user.id, org: user.org_id, pv: passwordStamp(user) }, JWT_SECRET, { expiresIn: SESSION });
 }
 
-// u must carry org_name and org_state from the organizations row
-function publicUser(u) {
-  return { id: u.id, email: u.email, name: u.name, role: u.role, org_id: u.org_id, org_name: u.org_name, state_code: u.org_state || null };
+// ---- platform: who runs the software, and whether a business may use it today ----
+// PLATFORM_ADMIN_EMAILS: comma-separated emails of the people who run this software (the Platform admin page).
+export const PLATFORM_ADMINS = (process.env.PLATFORM_ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+export const isPlatformAdmin = u => !!u && PLATFORM_ADMINS.includes(String(u.email).toLowerCase());
+// shown to a business whose portal is paused or whose subscription ended, e.g. "98200 00000 / support@yourbrand.in"
+const SUPPORT = process.env.SUPPORT_CONTACT || '';
+// subscriptions run to the end of the "paid until" day in India
+export const todayIndia = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const dayText = d => { const [y, m, dd] = d.split('-').map(Number); return `${dd} ${MONTHS[m - 1]} ${y}`; };
+const daysBetween = (a, b) => Math.round((Date.parse(b) - Date.parse(a)) / 86400000);
+
+/** null when the business may use the app today; otherwise the reason (shown to its users). */
+export function accessBlock(u) {
+  if (isPlatformAdmin(u)) return null;
+  const contact = SUPPORT ? ` Please contact ${SUPPORT}` : ' Please contact your software provider';
+  if (u.org_status === 'paused') {
+    return { code: 'account_paused', error: `The portal for ${u.org_name} is paused${u.org_status_reason ? ` (${u.org_status_reason})` : ''}.${contact}.` };
+  }
+  if (u.org_auto_off && u.org_paid_until && u.org_paid_until < todayIndia()) {
+    return { code: 'account_expired', error: `The subscription for ${u.org_name} ended on ${dayText(u.org_paid_until)}.${contact} to renew.` };
+  }
+  return null;
 }
-const USER_WITH_ORG = 'select u.*, o.name org_name, o.state_code org_state from users u join organizations o on o.id=u.org_id';
+
+// u must carry the org_* fields from USER_WITH_ORG
+function publicUser(u) {
+  const sub = u.org_paid_until ? { paid_until: u.org_paid_until, days_left: daysBetween(todayIndia(), u.org_paid_until), auto_off: u.org_auto_off } : null;
+  return { id: u.id, email: u.email, name: u.name, role: u.role, org_id: u.org_id, org_name: u.org_name, state_code: u.org_state || null,
+    platform_admin: isPlatformAdmin(u), subscription: sub };
+}
+const USER_WITH_ORG = `select u.*, o.name org_name, o.state_code org_state, o.status org_status, o.status_reason org_status_reason,
+  o.paid_until::text org_paid_until, o.auto_off org_auto_off from users u join organizations o on o.id=u.org_id`;
+
+// Usage: each 5-minute window in which someone does anything counts once (about 5 minutes of use).
+const lastWindow = new Map();
+function trackUse(u) {
+  const w = Math.floor(Date.now() / 300000);
+  if (lastWindow.get(u.id) === w) return;
+  lastWindow.set(u.id, w);
+  db.query(`insert into usage_blocks (user_id, org_id, day, blocks) values ($1,$2,$3,1)
+    on conflict (user_id, day) do update set blocks = usage_blocks.blocks + 1`, [u.id, u.org_id, todayIndia()]).catch(() => {});
+  db.query('update users set last_seen_at=now() where id=$1', [u.id]).catch(() => {});
+}
 const checkState = code => {
   if (!STATE_NAME[code]) throw new HttpError(400, 'Please choose the state where your business is registered for GST.');
 };
@@ -142,6 +181,11 @@ authRouter.post('/login', wrap(async (req, res) => {
     await logActivity(req, 'login.failed', 'Tried to log in, but the account is turned off', {}, u);
     throw new HttpError(403, 'Your account has been turned off. Please contact the owner.');
   }
+  const block = accessBlock(u);
+  if (block) {
+    await logActivity(req, 'login.failed', block.code === 'account_paused' ? 'Tried to log in while the portal is paused' : 'Tried to log in after the subscription ended', {}, u);
+    throw new HttpError(403, block.error, { code: block.code });
+  }
   await db.query('update users set last_login_at=now() where id=$1', [u.id]);
   await logActivity(req, 'login.success', 'Logged in', {}, u);
   res.json({ token: sign(u), user: publicUser(u) });
@@ -176,7 +220,11 @@ export const requireAuth = wrap(async (req, _res, next) => {
   const u = (await db.query(USER_WITH_ORG + ' where u.id=$1', [claims.sub])).rows[0];
   if (!u || !u.active) throw new HttpError(401, 'Please log in.');
   if (claims.pv && claims.pv !== passwordStamp(u)) throw new HttpError(401, 'Your password was changed. Please log in again.');
+  const block = accessBlock(u);
+  if (block) throw new HttpError(403, block.error, { code: block.code });
+  u.platform_admin = isPlatformAdmin(u);
   req.user = u;
+  trackUse(u);
   next();
 });
 

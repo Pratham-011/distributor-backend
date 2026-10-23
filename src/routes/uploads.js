@@ -11,10 +11,12 @@ import { putFile, getFile, removeFile } from '../storage.js';
 import { REPORT_TYPES, TYPE_LIST, suggestMapping } from '../excel/reportTypes.js';
 import { readGrid, guessHeaderRow, bannerOf, headersOf, detectType, periodOf, bodyOf, signatureOf, sha256, cellText } from '../excel/read.js';
 import { applyMapping } from '../excel/importer.js';
+import { inLine, jobIdOf, jobState } from '../excel/queue.js';
 
 const TMP = process.env.TMP_UPLOAD_DIR || './data/tmp';
 const TMP_TTL_MS = 2 * 60 * 60 * 1000;
-const MAX_FILE_MB = 50;   // same limit in the browser (web/src/pages/Upload.jsx) and the message in http.js
+// largest file accepted; the browser gets it from /meta, and http.js uses the same setting for its message
+export const MAX_FILE_MB = Number(process.env.MAX_FILE_MB) || 25;
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_FILE_MB * 1024 * 1024, files: 20 } });
 
 export const uploadsRouter = Router();
@@ -53,6 +55,10 @@ export async function cleanTmp() {
   } catch { /* nothing to clean */ }
 }
 
+// Reading a big file takes seconds of uninterrupted work; a short pause between stages lets the server answer
+// other requests (progress questions, reports, health checks) in between.
+const breathe = () => new Promise(r => setImmediate(r));
+
 // ids of suggested corrections the person accepted, like "134:discount"
 const acceptList = a => (Array.isArray(a) ? a.filter(x => typeof x === 'string' && /^\d+:[a-z_]+$/.test(x)).slice(0, 20000) : []);
 
@@ -83,9 +89,14 @@ async function overlapInfo(orgId, type, period, hash) {
   return { duplicate: dup || null, existing };
 }
 
-/** Everything the mapping screen needs for one file. */
+/**
+ * Everything the mapping screen needs for one file. The file is read once; when the person has chosen
+ * columns (opts.mapping) the check runs with those, otherwise with the saved format or our suggestion.
+ */
 async function analyse(orgId, buffer, fileName, opts = {}) {
-  const { grid } = readGrid(buffer, fileName);
+  await breathe();
+  let { grid } = readGrid(buffer, fileName);
+  await breathe();
   const headerRow = opts.header_row ?? guessHeaderRow(grid);
   const banner = bannerOf(grid, headerRow);
   const headers = headersOf(grid, headerRow);
@@ -100,6 +111,7 @@ async function analyse(orgId, buffer, fileName, opts = {}) {
     rows_preview: grid.slice(0, Math.min(grid.length, 30)).map((r, i) => ({ row: i + 1, text: r.map(cellText).filter(Boolean).slice(0, 6).join(' · ') })),
     report_type: type, period, template: null, mapping: {}, date_format: 'DMY', needs_mapping: true,
   };
+  grid = null;   // everything needed from the sheet is in body / result now
   if (!type) return result;
 
   const sig = signatureOf(type, headers);
@@ -117,8 +129,13 @@ async function analyse(orgId, buffer, fileName, opts = {}) {
     result.mapping = { ...guess, ...carried };
     if (prev) result.date_format = prev.date_format;
   }
+  if (opts.mapping) {
+    result.mapping = opts.mapping;
+    result.date_format = opts.date_format || result.date_format;
+  }
+  await breathe();
   // Dry run so the person sees problems before saving
-  const dry = applyMapping(type, body, result.mapping, { dateFormat: result.date_format, banner: period, homeState: opts.homeState });
+  const dry = applyMapping(type, body, result.mapping, { dateFormat: result.date_format, banner: period, homeState: opts.homeState, accept: opts.accept });
   result.check = { errors: dry.errors, issues: dry.issues, reconciliation: dry.reconciliation, stats: dry.stats, period: dry.period };
   result.needs_mapping = !result.template || dry.errors;
   Object.assign(result, await overlapInfo(orgId, type, dry.period, hash));
@@ -127,19 +144,20 @@ async function analyse(orgId, buffer, fileName, opts = {}) {
 
 // ---------- routes ----------
 uploadsRouter.get('/meta', (_req, res) => {
-  res.json({ types: TYPE_LIST, fields: Object.fromEntries(Object.values(REPORT_TYPES).map(t => [t.key, t.fields.map(({ key, label, kind, required }) => ({ key, label, kind, required: !!required }))])) });
+  res.json({ max_file_mb: MAX_FILE_MB, types: TYPE_LIST, fields: Object.fromEntries(Object.values(REPORT_TYPES).map(t => [t.key, t.fields.map(({ key, label, kind, required }) => ({ key, label, kind, required: !!required }))])) });
 });
 
 uploadsRouter.post('/preview', requireRole('writer'), upload.array('files', 20), wrap(async (req, res) => {
   if (!req.files?.length) throw new HttpError(400, 'Please choose at least one file.');
   cleanTmp();
+  const job = jobIdOf(req);
   const out = [];
   for (const f of req.files) {
     f.originalname = Buffer.from(f.originalname, 'latin1').toString('utf8');
     if (!/\.(xlsx?|csv)$/i.test(f.originalname)) { out.push({ file_name: f.originalname, error: 'Only Excel (.xls, .xlsx) or CSV files can be uploaded.' }); continue; }
     try {
       const token = await saveTmp(req.user.org_id, f);
-      out.push({ token, ...(await analyse(req.user.org_id, f.buffer, f.originalname, { homeState: req.user.org_state })) });
+      out.push({ token, ...(await inLine(job, () => analyse(req.user.org_id, f.buffer, f.originalname, { homeState: req.user.org_state }))) });
     } catch (e) {
       out.push({ file_name: f.originalname, error: e instanceof HttpError ? e.message : (e.message || 'Could not read this file.') });
     }
@@ -162,16 +180,8 @@ uploadsRouter.delete('/preview/:token', requireRole('writer'), wrap(async (req, 
 uploadsRouter.post('/preview/:token', requireRole('writer'), wrap(async (req, res) => {
   const { meta, buffer } = await loadTmp(req.user.org_id, req.params.token);
   const opts = { header_row: req.body.header_row, report_type: req.body.report_type, homeState: req.user.org_state };
-  const a = await analyse(req.user.org_id, buffer, meta.name, opts);
-  if (req.body.mapping && a.report_type) {
-    const { grid } = readGrid(buffer, meta.name);
-    const body = bodyOf(grid, a.header_row, a.headers);
-    a.mapping = req.body.mapping;
-    a.date_format = req.body.date_format || a.date_format;
-    const dry = applyMapping(a.report_type, body, a.mapping, { dateFormat: a.date_format, banner: a.period, homeState: req.user.org_state, accept: acceptList(req.body.accept) });
-    a.check = { errors: dry.errors, issues: dry.issues, reconciliation: dry.reconciliation, stats: dry.stats, period: dry.period };
-    Object.assign(a, await overlapInfo(req.user.org_id, a.report_type, dry.period, sha256(buffer)));
-  }
+  if (req.body.mapping) Object.assign(opts, { mapping: req.body.mapping, date_format: req.body.date_format, accept: acceptList(req.body.accept) });
+  const a = await inLine(jobIdOf(req), () => analyse(req.user.org_id, buffer, meta.name, opts));
   res.json({ token: req.params.token, ...a });
 }));
 
@@ -180,12 +190,21 @@ uploadsRouter.post('/commit', requireRole('writer'), wrap(async (req, res) => {
   const T = REPORT_TYPES[report_type];
   if (!T) throw new HttpError(400, 'Please choose what kind of file this is.');
   const { meta, buffer } = await loadTmp(req.user.org_id, token);
-  const { grid } = readGrid(buffer, meta.name);
+  // the whole save holds the file's rows in memory, so it takes its turn in the line like a check
+  return inLine(jobIdOf(req), () => commitFile(req, res, { token, report_type, header_row, mapping, date_format, save_template, template_name, T, meta, buffer }));
+}));
+
+async function commitFile(req, res, { token, report_type, header_row, mapping, date_format, save_template, template_name, T, meta, buffer }) {
+  await breathe();
+  let { grid } = readGrid(buffer, meta.name);
+  await breathe();
   const headers = headersOf(grid, header_row);
   const banner = periodOf(bannerOf(grid, header_row));
   const body = bodyOf(grid, header_row, headers);
+  grid = null;
   for (const h of Object.values(mapping || {})) if (h && !headers.includes(h)) throw new HttpError(400, `Column "${h}" is not in this file.`);
   const accept = acceptList(req.body.accept);
+  await breathe();
   const r = applyMapping(report_type, body, mapping, { dateFormat: date_format, banner, homeState: req.user.org_state, accept });
   const corrections = r.issues.find(i => i.corrections)?.corrections || [];
   if (r.errors) throw new HttpError(422, 'This file has problems that must be fixed before saving.', { issues: r.issues, reconciliation: r.reconciliation });
@@ -245,7 +264,10 @@ uploadsRouter.post('/commit', requireRole('writer'), wrap(async (req, res) => {
     upload: { id: uploadId, report_type, file_name: meta.name, period: r.period, rows: r.rows.length, stored_bytes: storedBytes, size_bytes: buffer.length },
     stats: r.stats, issues: r.issues, reconciliation: r.reconciliation, replaced,
   });
-}));
+}
+
+// Where a file is in the line (the browser asks while it waits for an upload, check or save)
+uploadsRouter.get('/progress/:job', (req, res) => res.json(jobState(req.params.job)));
 
 async function replaceExisting(t, orgId, type, period) {
   if (!period.from || !period.to) return [];
@@ -351,10 +373,12 @@ async function readBack(u, homeState) {
   }
   if (!s) return null;
   const buffer = await getFile(u.storage_path);
-  const { grid } = readGrid(buffer, u.file_name);
+  let { grid } = readGrid(buffer, u.file_name);
   const headers = headersOf(grid, s.header_row);
   const body = bodyOf(grid, s.header_row, headers);
-  const r = applyMapping(u.report_type, body, s.mapping, { dateFormat: s.date_format, banner: periodOf(bannerOf(grid, s.header_row)), homeState, accept: s.accept || [] });
+  const banner = periodOf(bannerOf(grid, s.header_row));
+  grid = null;
+  const r = applyMapping(u.report_type, body, s.mapping, { dateFormat: s.date_format, banner, homeState, accept: s.accept || [] });
   // with the exact settings the file was accepted once already; a saved format may have changed since
   return r.rows.length && (exact || !r.errors) ? r : null;
 }
@@ -437,7 +461,7 @@ async function takeOut(req, u, finalStatus) {
 
   const batches = [];
   for (const { prev, days } of restore.values()) {
-    const r = await readBack(prev, req.user.org_state).catch(() => null);
+    const r = await inLine(crypto.randomUUID(), () => readBack(prev, req.user.org_state)).catch(() => null);
     if (!r) {
       throw new HttpError(409, `This upload cannot be taken out automatically: the earlier file "${prev.file_name}" that it replaced could not be read back. ` +
         'Upload the correct file again instead; it will replace this one.');

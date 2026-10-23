@@ -17,14 +17,30 @@ export function readGrid(buffer, fileName = '') {
     throw new Error('This file could not be opened. Please upload the Excel (.xls / .xlsx) or CSV file exactly as exported.');
   }
   // These exports carry empty Sheet1/Sheet2; use the sheet that has the most filled rows.
+  // Rows are counted straight from the parsed sheet and only the chosen sheet is turned into a grid,
+  // so a workbook with several sheets isn't held in memory twice.
   let best = null;
   for (const name of wb.SheetNames) {
-    const grid = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, raw: true, defval: null, blankrows: true });
-    const filled = grid.filter(r => r.some(c => !isEmpty(c))).length;
-    if (!best || filled > best.filled) best = { name, grid, filled };
+    const filled = filledRows(wb.Sheets[name]);
+    if (!best || filled > best.filled) best = { name, filled };
   }
   if (!best || best.filled === 0) throw new Error('This file is empty.');
-  return { sheet: best.name, grid: best.grid };
+  const grid = XLSX.utils.sheet_to_json(wb.Sheets[best.name], { header: 1, raw: true, defval: null, blankrows: true });
+  return { sheet: best.name, grid };
+}
+
+// Rows with at least one value inside the sheet's range (the same rows sheet_to_json would return as filled).
+// In dense mode each row is an array of cells at ws[rowIndex].
+function filledRows(ws) {
+  if (!ws?.['!ref']) return 0;
+  const r = XLSX.utils.decode_range(ws['!ref']);
+  let n = 0;
+  for (let R = r.s.r; R <= r.e.r; R++) {
+    const row = ws[R];
+    if (!row) continue;
+    for (let C = r.s.c; C <= r.e.c; C++) if (row[C] && !isEmpty(row[C].v)) { n++; break; }
+  }
+  return n;
 }
 
 export function guessHeaderRow(grid) {
