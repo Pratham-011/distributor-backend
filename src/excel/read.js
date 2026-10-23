@@ -52,6 +52,7 @@ export function detectType(banner, headers) {
   if (h.has('suppliername') && h.has('refinvno')) return 'debit_note';
   if (h.has('suppliername') && h.has('vno')) return 'purchase';
   if (h.has('invno') && h.has('partyname')) return 'sales';
+  if ((h.has('closingqty') || h.has('clqty') || h.has('closingstock')) && !h.has('partyname')) return 'stock';
   return null;
 }
 

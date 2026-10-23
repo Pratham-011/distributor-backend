@@ -177,6 +177,31 @@ alter table uploads add column if not exists undone_by uuid references users(id)
 alter table uploads drop constraint if exists uploads_status_check;
 alter table uploads add constraint uploads_status_check check (status in ('active','replaced','deleted','undone'));
 
+-- stock is a snapshot "as on" a date (from the Stock Statement / closing stock report); batch-wise files give several rows per item
+create table if not exists stock_items (
+  id            bigserial primary key,
+  org_id        uuid not null references organizations(id) on delete cascade,
+  upload_id     uuid not null references uploads(id) on delete cascade,
+  row_no        int not null,
+  as_on         date not null,
+  sku_code      text not null,
+  sku_name      text,
+  brand         text,
+  batch         text,
+  expiry        date,
+  opening_qty   numeric(14,3),
+  in_qty        numeric(14,3),
+  out_qty       numeric(14,3),
+  closing_qty   numeric(14,3) not null default 0,
+  rate          numeric(14,4),
+  mrp           numeric(14,2),
+  value         numeric(14,2)
+);
+create index if not exists stock_q on stock_items (org_id, as_on);
+create index if not exists stock_upload on stock_items (upload_id);
+-- for "sold per day" and "estimated stock today" on the Stock page
+create index if not exists doc_lines_sku on doc_lines (org_id, sku_code, doc_type, doc_date);
+
 -- everything people do in the app, newest first
 create table if not exists activity_log (
   id          bigserial primary key,
@@ -203,3 +228,4 @@ alter table doc_lines         enable row level security;
 alter table receipts          enable row level security;
 alter table outstanding_bills enable row level security;
 alter table activity_log      enable row level security;
+alter table stock_items       enable row level security;

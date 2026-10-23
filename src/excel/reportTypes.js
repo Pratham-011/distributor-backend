@@ -100,7 +100,27 @@ export const REPORT_TYPES = {
       { key: 'salesman', label: 'Salesman', kind: 'text', match: ['salesmanname', 'salesman'] },
     ],
   },
+  // Closing stock / stock summary, "as on" a date (like Outstanding). Batch-wise files are fine: rows are added up per item.
+  stock: {
+    key: 'stock', label: 'Stock Statement', short: 'Stock', table: 'stock_items', snapshot: true,
+    titles: ['stock statement', 'stock summary', 'closing stock', 'stock report', 'stock position', 'stock register', 'inventory'],
+    fields: [
+      { key: 'sku_code', label: 'Item code (SKU)', kind: 'text', required: true, match: ['skucode', 'itemcode', 'productcode', 'code'] },
+      { key: 'sku_name', label: 'Item name', kind: 'text', required: true, match: ['skuname', 'itemname', 'productname', 'description', 'particulars', 'item'] },
+      { key: 'opening_qty', label: 'Opening quantity', kind: 'qty', match: ['openingqty', 'opqty', 'opening', 'openingstock'] },
+      { key: 'in_qty', label: 'Received (in) quantity', kind: 'qty', match: ['inwardqty', 'inqty', 'inward', 'receiptqty', 'purchaseqty'] },
+      { key: 'out_qty', label: 'Issued (out) quantity', kind: 'qty', match: ['outwardqty', 'outqty', 'outward', 'issueqty', 'salesqty'] },
+      { key: 'closing_qty', label: 'Closing quantity (in stock)', kind: 'qty', required: true,
+        match: ['closingqty', 'clqty', 'closingstock', 'closing', 'stockqty', 'balanceqty', 'stock', 'qty', 'quantity'] },
+      { key: 'rate', label: 'Rate (cost per unit)', kind: 'rate', match: ['rate', 'costrate', 'purchaserate', 'landingrate'] },
+      { key: 'value', label: 'Stock value', kind: 'money', match: ['closingvalue', 'clvalue', 'stockvalue', 'value', 'amount'] },
+      { key: 'mrp', label: 'MRP', kind: 'money', match: ['mrp'] },
+      { key: 'batch', label: 'Batch', kind: 'text', match: ['batchno', 'batch'] },
+      { key: 'expiry', label: 'Expiry date', kind: 'date', match: ['expirydate', 'expdate', 'expiry'] },
+    ],
+  },
 };
+export const SNAPSHOT_TYPES = Object.values(REPORT_TYPES).filter(t => t.snapshot || t.key === 'outstanding').map(t => t.key);
 
 export const TYPE_LIST = Object.values(REPORT_TYPES).map(t => ({ key: t.key, label: t.label, short: t.short }));
 

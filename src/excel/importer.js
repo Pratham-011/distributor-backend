@@ -2,7 +2,7 @@
 // and the totals cross-check against the file's own TOTALS row.
 // All money arithmetic uses Decimal; values leave as strings for Postgres NUMERIC.
 import Decimal from 'decimal.js';
-import { REPORT_TYPES } from './reportTypes.js';
+import { REPORT_TYPES, SNAPSHOT_TYPES } from './reportTypes.js';
 import { isEmpty, isoDate, cellText } from './read.js';
 import { brandOf } from './brands.js';
 
@@ -143,18 +143,30 @@ export function applyMapping(typeKey, body, mapping, { dateFormat = 'DMY', banne
   if (T.table === 'doc_lines') docChecks(typeKey, out, mapping, issues, homeState, new Set(accept));
   if (typeKey === 'receipt') receiptChecks(out, issues);
   if (typeKey === 'outstanding') outstandingChecks(out, issues);
+  if (typeKey === 'stock') stockChecks(out, mapping, issues);
 
   // ---- period ----
-  const dateKey = T.fields.find(f => f.required && f.kind === 'date').key;
-  const dates = out.map(r => r[dateKey]).filter(Boolean).sort();
+  // snapshots (Outstanding, Stock) are "as on" one date, taken from the title rows; registers cover their row dates
+  const snapshot = SNAPSHOT_TYPES.includes(typeKey);
   let period;
-  if (typeKey === 'outstanding') period = { from: banner.to || banner.from || null, to: banner.to || banner.from || null };
-  else period = { from: banner.from || dates[0] || null, to: banner.to || dates[dates.length - 1] || null };
-  if (typeKey !== 'outstanding' && dates.length && period.from && (dates[0] < period.from || dates[dates.length - 1] > period.to)) {
-    period = { from: dates[0] < period.from ? dates[0] : period.from, to: dates[dates.length - 1] > period.to ? dates[dates.length - 1] : period.to };
-  }
-  if (typeKey === 'outstanding' && !period.from) {
-    issues.push(issue('error', 'Could not find the "As on" date at the top of this file.'));
+  if (snapshot) {
+    const d = banner.to || banner.from || null;
+    period = { from: d, to: d };
+    if (!d && typeKey === 'stock') {
+      // stock reports don't always print a date: take today's, and say so
+      const today = new Date().toISOString().slice(0, 10);
+      period = { from: today, to: today };
+      issues.push(issue('warning', `No "As on" date at the top of this file, so it is saved as the stock on ${today.split('-').reverse().join('/')} (today).`));
+    } else if (!d) {
+      issues.push(issue('error', 'Could not find the "As on" date at the top of this file.'));
+    }
+  } else {
+    const dateKey = T.fields.find(f => f.required && f.kind === 'date').key;
+    const dates = out.map(r => r[dateKey]).filter(Boolean).sort();
+    period = { from: banner.from || dates[0] || null, to: banner.to || dates[dates.length - 1] || null };
+    if (dates.length && period.from && (dates[0] < period.from || dates[dates.length - 1] > period.to)) {
+      period = { from: dates[0] < period.from ? dates[0] : period.from, to: dates[dates.length - 1] > period.to ? dates[dates.length - 1] : period.to };
+    }
   }
 
   // serialise decimals
@@ -165,7 +177,9 @@ export function applyMapping(typeKey, body, mapping, { dateFormat = 'DMY', banne
   });
   const sumOf = k => out.reduce((a, r) => a.plus(r[k] || Z), Z).toFixed(2);
   const stats = { rows: rows.length, ...(T.table === 'doc_lines' ? { taxable: sumOf('taxable'), docs: new Set(rows.map(r => r.doc_no)).size }
-    : typeKey === 'receipt' ? { amount: sumOf('amount') } : { balance: sumOf('balance') }) };
+    : typeKey === 'receipt' ? { amount: sumOf('amount') }
+      : typeKey === 'stock' ? { items: new Set(rows.map(r => r.sku_code)).size, stock_qty: sumOf('closing_qty'), ...(mapping.value || mapping.rate ? { stock_value: sumOf('value') } : {}) }
+        : { balance: sumOf('balance') }) };
   return { rows, issues, reconciliation, period, stats, errors: issues.some(i => i.level === 'error') };
 }
 
@@ -329,6 +343,24 @@ function receiptChecks(out, issues) {
   const seen = new Map(), dup = [];
   for (const r of out) { if (seen.has(r.v_no)) dup.push(r.row_no, seen.get(r.v_no)); else seen.set(r.v_no, r.row_no); }
   if (dup.length) issues.push(issue('error', 'The same receipt number appears more than once', [...new Set(dup)]));
+}
+
+function stockChecks(out, mapping, issues) {
+  for (const r of out) {
+    r.brand = brandOf(r.sku_name);
+    // no value column: work it out from the rate when there is one
+    if (!mapping.value && mapping.rate) r.value = r.closing_qty.times(r.rate).toDecimalPlaces(2);
+    else if (!mapping.value) r.value = null;
+  }
+  const neg = out.filter(r => r.closing_qty.lt(0)).map(r => r.row_no);
+  if (neg.length) issues.push(issue('warning', 'Some items show minus stock (sold more than received). Check them in the billing software.', neg));
+  if (mapping.opening_qty && mapping.in_qty && mapping.out_qty) {
+    const m = out.filter(r => r.opening_qty.plus(r.in_qty).minus(r.out_qty).minus(r.closing_qty).abs().gt('0.001')).map(r => r.row_no);
+    if (m.length) issues.push(issue('warning', 'Opening + In − Out is not equal to Closing quantity on some rows', m));
+  }
+  if (!mapping.value && !mapping.rate) {
+    issues.push(issue('warning', 'This file has no value or rate column, so stock value will be worked out from your latest purchase rates.'));
+  }
 }
 
 function outstandingChecks(out, issues) {

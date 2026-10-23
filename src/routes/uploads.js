@@ -254,14 +254,12 @@ async function replaceExisting(t, orgId, type, period) {
     [orgId, type, period.from, period.to])).rows;
   if (!olds.length) return [];
   const ids = olds.map(o => o.id);
-  if (type === 'outstanding') {
-    await t.query(`delete from outstanding_bills where org_id=$1 and as_on between $2 and $3`, [orgId, period.from, period.to]);
-  } else if (type === 'receipt') {
-    await t.query(`delete from receipts where org_id=$1 and v_date between $2 and $3`, [orgId, period.from, period.to]);
-  } else {
+  const table = REPORT_TYPES[type].table;
+  if (table === 'doc_lines') {
     await t.query(`delete from doc_lines where org_id=$1 and doc_type=$2 and doc_date between $3 and $4`, [orgId, type, period.from, period.to]);
+  } else {
+    await t.query(`delete from ${table} where org_id=$1 and ${ROW_DATE[table]} between $2 and $3`, [orgId, period.from, period.to]);
   }
-  const table = type === 'outstanding' ? 'outstanding_bills' : type === 'receipt' ? 'receipts' : 'doc_lines';
   for (const id of ids) {
     const n = (await t.query(`select count(*)::int n from ${table} where upload_id=$1`, [id])).rows[0].n;
     await t.query(`update uploads set row_count=$1, status=case when $1=0 then 'replaced' else status end where id=$2`, [n, id]);
@@ -287,6 +285,12 @@ async function insertRows(t, T, orgId, uploadId, type, r) {
       party_name: x.party_name ?? null, city: x.city ? x.city.replace(/\s+/g, ' ').trim() : null, amount: x.amount, account: x.account ?? null,
       mode: x.mode, cheque_no: x.cheque_no ?? null, cheque_date: x.cheque_date ?? null, bank: x.bank ?? null, collected_by: x.collected_by,
     })));
+  } else if (type === 'stock') {
+    await bulkInsert(t, 'stock_items', r.rows.map(x => ({
+      org_id: orgId, upload_id: uploadId, row_no: x.row_no, as_on: r.period.to, sku_code: x.sku_code, sku_name: x.sku_name ?? null,
+      brand: x.brand ?? null, batch: x.batch ?? null, expiry: x.expiry ?? null, opening_qty: x.opening_qty ?? null, in_qty: x.in_qty ?? null,
+      out_qty: x.out_qty ?? null, closing_qty: x.closing_qty ?? '0', rate: x.rate ?? null, mrp: x.mrp ?? null, value: x.value ?? null,
+    })), 500);
   } else {
     await bulkInsert(t, 'outstanding_bills', r.rows.map(x => ({
       org_id: orgId, upload_id: uploadId, row_no: x.row_no, as_on: r.period.to, bill_date: x.bill_date ?? null, trn: x.trn ?? null,
@@ -327,7 +331,7 @@ uploadsRouter.get('/:id/download', wrap(async (req, res) => {
 // stored original file. Days that a later upload has since taken over are left alone.
 // The undone upload's own file is kept, so it can still be downloaded.
 
-const ROW_DATE = { doc_lines: 'doc_date', receipts: 'v_date', outstanding_bills: 'as_on' };
+const ROW_DATE = { doc_lines: 'doc_date', receipts: 'v_date', outstanding_bills: 'as_on', stock_items: 'as_on' };
 
 function daysOf(from, to) {
   const out = [];

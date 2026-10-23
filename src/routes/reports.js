@@ -67,6 +67,7 @@ reportsRouter.get('/dates', wrap(async (req, res) => {
     select doc_type t, doc_date::text d from doc_lines where org_id=$1 group by 1,2
     union all select 'receipt', v_date::text from receipts where org_id=$1 group by 2
     union all select 'outstanding', as_on::text from outstanding_bills where org_id=$1 group by 2
+    union all select 'stock', as_on::text from stock_items where org_id=$1 group by 2
     order by 2 desc`, [org]);
   const latest = {};
   const days = {};
@@ -195,17 +196,146 @@ reportsRouter.get('/collections', wrap(async (req, res) => {
   res.json({ totals, modes, people, parties, cheques, cheque_total: chequeTotal, accounts, daily });
 }));
 
-// The receipts behind one row of "Collected by" (by=person) or "Shops" (by=party), for the chosen dates
+// Receipts for the chosen dates: every one (no `by`), or those behind one row of
+// "Collected by" (by=person) or "Shops" (by=party)
 reportsRouter.get('/collections/receipts', wrap(async (req, res) => {
   const p = range(req);
   const key = String(req.query.key ?? '');
   const col = { person: 'collected_by', party: 'coalesce(party_code, party_name)' }[req.query.by];
-  if (!col || !key) throw new HttpError(400, 'Please choose a person or a shop.');
-  const receipts = await q(`select v_no, v_date::text date, party_name, party_code, collected_by, mode, account, bank, cheque_no,
+  if (req.query.by && (!col || !key)) throw new HttpError(400, 'Please choose a person or a shop.');
+  const receipts = await q(`select v_no, v_date::text date, party_name, party_code, city, collected_by, mode, account, bank, cheque_no,
       cheque_date::text cheque_date, amount
-    from receipts where org_id=$1 and v_date between $2 and $3 and ${col} = $4
-    order by case mode when 'Cash' then 1 when 'Cheque' then 2 else 3 end, v_date, v_no limit 2000`, [...p, key]);
+    from receipts where org_id=$1 and v_date between $2 and $3 ${col ? `and ${col} = $4` : ''}
+    order by ${col ? `case mode when 'Cash' then 1 when 'Cheque' then 2 else 3 end, ` : ''}v_date, v_no limit 10000`, col ? [...p, key] : p);
   res.json({ receipts });
+}));
+
+// ---------- stock ----------
+// Stock in hand per item, counted from the uploaded registers:
+//   purchases + returns from shops (credit notes) − sales − returns to the company (debit notes)
+// from the first uploaded day up to "as on". Stock held before the first upload isn't in any register, so if a
+// Stock Statement was uploaded on or before "as on", the latest one is the starting point and only files after it count.
+//  - sold per day: sales in the 30 days up to "as on", over the days that have sales uploaded
+//  - value: quantity × latest purchase rate on or before "as on" (or the statement's own rate)
+const LOW_DAYS = 7, EXCESS_DAYS = 45, EXPIRY_DAYS = 60;
+
+reportsRouter.get('/stock', wrap(async (req, res) => {
+  const org = req.user.org_id;
+  const span = await one(`select min(doc_date)::text first, max(doc_date)::text last from doc_lines where org_id=$1`, [org]);
+  const lastStatement = (await one(`select max(as_on)::text d from stock_items where org_id=$1`, [org]))?.d;
+  const latest = [span?.last, lastStatement].filter(Boolean).sort().at(-1) || null;
+  if (!latest) return res.json({ as_on: null, items: [] });
+  const asOn = ISO.test(req.query.as_on || '') ? req.query.as_on : latest;
+  const base = (await one(`select max(as_on)::text d from stock_items where org_id=$1 and as_on <= $2`, [org, asOn]))?.d || null;
+  const p = [org, asOn, base];   // $3 = statement date used as the starting point, or null = from the first upload
+
+  const [items, window] = await Promise.all([
+    q(`with st as (
+         select sku_code, max(sku_name) name, max(brand) brand, sum(closing_qty) qty,
+                sum(value) / nullif(sum(closing_qty), 0) rate,
+                min(expiry) filter (where closing_qty > 0) expiry,
+                coalesce(sum(closing_qty) filter (where expiry <= $2::date + ${EXPIRY_DAYS}), 0) expiring_qty
+         from stock_items where org_id=$1 and as_on = $3::date group by sku_code),
+       mv as (
+         select sku_code, max(sku_name) name, max(brand) brand,
+                coalesce(sum(qty) filter (where doc_type='purchase'), 0) bought,
+                coalesce(sum(qty) filter (where doc_type='credit_note'), 0) returned_in,
+                coalesce(sum(qty) filter (where doc_type='sales'), 0) sold,
+                coalesce(sum(qty) filter (where doc_type='debit_note'), 0) returned_out
+         from doc_lines where org_id=$1 and doc_date <= $2 and ($3::date is null or doc_date > $3::date) group by sku_code),
+       s30 as (
+         select sku_code, sum(qty) qty from doc_lines
+         where org_id=$1 and doc_type='sales' and doc_date > $2::date - 30 and doc_date <= $2 group by sku_code),
+       pr as (
+         select distinct on (sku_code) sku_code, taxable / nullif(qty, 0) rate from doc_lines
+         where org_id=$1 and doc_type='purchase' and qty > 0 and doc_date <= $2 order by sku_code, doc_date desc)
+       select coalesce(st.sku_code, mv.sku_code) code, coalesce(st.name, mv.name) name, coalesce(st.brand, mv.brand) brand,
+              coalesce(st.qty, 0) opening, coalesce(mv.bought, 0) bought, coalesce(mv.returned_in, 0) returned_in,
+              coalesce(mv.sold, 0) sold, coalesce(mv.returned_out, 0) returned_out,
+              coalesce(st.qty, 0) + coalesce(mv.bought, 0) + coalesce(mv.returned_in, 0) - coalesce(mv.sold, 0) - coalesce(mv.returned_out, 0) qty,
+              round(coalesce(pr.rate, st.rate), 4) rate, coalesce(s30.qty, 0) sold30,
+              st.expiry::text expiry, coalesce(st.expiring_qty, 0) expiring_qty
+       from st full outer join mv on mv.sku_code = st.sku_code
+       left join s30 on s30.sku_code = coalesce(st.sku_code, mv.sku_code)
+       left join pr on pr.sku_code = coalesce(st.sku_code, mv.sku_code)`, p),
+    one(`select count(distinct doc_date)::int days from doc_lines where org_id=$1 and doc_type='sales' and doc_date > $2::date - 30 and doc_date <= $2`, p.slice(0, 2)),
+  ]);
+
+  const days = window.days;
+  for (const it of items) {
+    const qty = Number(it.qty), perDay = days ? Number(it.sold30) / days : 0;
+    it.qty = String(Number(qty.toFixed(3)));
+    it.value = it.rate != null && qty > 0 ? (qty * Number(it.rate)).toFixed(2) : qty > 0 ? null : '0.00';
+    it.per_day = perDay.toFixed(2);
+    it.cover = perDay > 0 && qty > 0 ? Math.floor(qty / perDay) : null;
+    it.status = qty < 0 ? 'minus'
+      : qty === 0 ? (perDay > 0 ? 'out' : 'none')
+        : it.cover === null ? 'no_sales'
+          : it.cover < LOW_DAYS ? 'low' : it.cover > EXCESS_DAYS ? 'excess' : 'ok';
+    it.near_expiry = Number(it.expiring_qty) > 0 && qty > 0;
+  }
+  // items that never had stock in this period and aren't selling aren't worth a row
+  const list = items.filter(i => i.status !== 'none')
+    .sort((a, b) => Number(b.value || 0) - Number(a.value || 0) || Number(b.sold30) - Number(a.sold30));
+  const sum = (l, k) => l.reduce((a, x) => a + Math.round(Number(x[k] || 0) * 100), 0) / 100;
+  const inStock = list.filter(i => Number(i.qty) > 0);
+  const brands = Object.values(inStock.reduce((m, i) => {
+    const b = (m[i.brand || 'Other'] ||= { name: i.brand || 'Other', items: 0, qty: 0, value: 0 });
+    b.items++; b.qty += Number(i.qty); b.value += Number(i.value || 0);
+    return m;
+  }, {})).map(b => ({ ...b, value: b.value.toFixed(2) })).sort((a, b) => b.value - a.value);
+  const count = s => list.filter(i => i.status === s).length;
+  res.json({
+    as_on: asOn, latest, first: span?.first || null, base, sales_days: days,
+    limits: { low: LOW_DAYS, excess: EXCESS_DAYS, expiry: EXPIRY_DAYS },
+    summary: {
+      value: sum(inStock, 'value').toFixed(2), unvalued: inStock.filter(i => i.value == null).length,
+      items: inStock.length, qty: sum(inStock, 'qty'),
+      out: count('out'), low: count('low'), minus: count('minus'), no_sales: count('no_sales'),
+      excess_value: sum(list.filter(i => i.status === 'excess'), 'value').toFixed(2),
+      no_sales_value: sum(list.filter(i => i.status === 'no_sales'), 'value').toFixed(2),
+      near_expiry: list.filter(i => i.near_expiry).length,
+    },
+    brands, items: list,
+  });
+}));
+
+// Every purchase, sale and return of one item over the period the Stock page counts, with the running stock
+reportsRouter.get('/stock/item', wrap(async (req, res) => {
+  const org = req.user.org_id;
+  const code = String(req.query.code || '');
+  const asOn = ISO.test(req.query.as_on || '') ? req.query.as_on : null;
+  if (!code || !asOn) throw new HttpError(400, 'Please choose an item.');
+  const base = (await one(`select max(as_on)::text d from stock_items where org_id=$1 and as_on <= $2`, [org, asOn]))?.d || null;
+  const opening = base ? (await one(`select coalesce(sum(closing_qty),0) q from stock_items where org_id=$1 and as_on=$2 and sku_code=$3`, [org, base, code])).q : '0';
+  const lines = await q(`select doc_date::text date, doc_type type, doc_no, party_name, party_code, sum(qty) qty, sum(taxable) taxable
+    from doc_lines where org_id=$1 and sku_code=$2 and doc_date <= $3 and ($4::date is null or doc_date > $4::date)
+    group by doc_date, doc_type, doc_no, party_name, party_code
+    order by doc_date, case doc_type when 'purchase' then 1 when 'credit_note' then 2 when 'debit_note' then 3 else 4 end, doc_no
+    limit 5000`, [org, code, asOn, base]);
+  let bal = Number(opening);
+  for (const l of lines) {
+    const inward = l.type === 'purchase' || l.type === 'credit_note';
+    l.in = inward ? l.qty : null;
+    l.out = inward ? null : l.qty;
+    bal += (inward ? 1 : -1) * Number(l.qty);
+    l.balance = String(Number(bal.toFixed(3)));
+  }
+  res.json({ base, opening, lines: lines.reverse() });   // newest first
+}));
+
+// In and out per item for the chosen dates, from the registers (works without a Stock Statement)
+reportsRouter.get('/stock/movement', wrap(async (req, res) => {
+  const p = range(req);
+  const items = await q(`select sku_code code, max(sku_name) name, max(brand) brand,
+      coalesce(sum(qty) filter (where doc_type='purchase'),0) purchased,
+      coalesce(sum(qty) filter (where doc_type='sales'),0) sold,
+      coalesce(sum(qty) filter (where doc_type='credit_note'),0) returned_in,
+      coalesce(sum(qty) filter (where doc_type='debit_note'),0) returned_out
+    from doc_lines where org_id=$1 and doc_date between $2 and $3 group by sku_code
+    order by sum(qty) filter (where doc_type='sales') desc nulls last limit 2000`, p);
+  for (const i of items) i.net = String(Number((Number(i.purchased) + Number(i.returned_in) - Number(i.sold) - Number(i.returned_out)).toFixed(3)));
+  res.json({ items });
 }));
 
 // ---------- outstanding ----------
@@ -228,6 +358,16 @@ reportsRouter.get('/outstanding', wrap(async (req, res) => {
        where org_id=$1 and as_on=$2 order by age_weeks desc, bill_date limit 20`, p),
   ]);
   res.json({ snapshots, as_on: asOn, summary, salesmen, parties, oldest });
+}));
+
+// Every unpaid bill of one salesman in a statement (Salesman-wise table on the Outstanding page)
+reportsRouter.get('/outstanding/salesman', wrap(async (req, res) => {
+  const org = req.user.org_id;
+  const asOn = ISO.test(req.query.as_on || '') ? req.query.as_on : await latestSnapshot(org);
+  const bills = await q(`select bill_date::text date, bill_no, trn, party_name, party_code, bill_amount, received, balance, age_weeks
+    from outstanding_bills where org_id=$1 and as_on=$2 and salesman is not distinct from $3
+    order by age_weeks desc, bill_date, bill_no limit 10000`, [org, asOn, req.query.name ?? null]);
+  res.json({ as_on: asOn, bills });
 }));
 
 // "How much does this party owe?" — search box on the Outstanding page
