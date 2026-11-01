@@ -9,10 +9,13 @@ const pad = n => String(n).padStart(2, '0');
 export const fmtDate = d => `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`;
 export const isoDate = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 
+const MAX_ROWS = 250000;
+
 export function readGrid(buffer, fileName = '') {
   let wb;
   try {
-    wb = XLSX.read(buffer, { type: 'buffer', cellDates: true, dense: true, raw: /\.csv$/i.test(fileName) ? false : undefined });
+    // sheetRows caps what is read: a crafted file that claims millions of rows can't use up the server's memory
+    wb = XLSX.read(buffer, { type: 'buffer', cellDates: true, dense: true, sheetRows: MAX_ROWS, raw: /\.csv$/i.test(fileName) ? false : undefined });
   } catch {
     throw new Error('This file could not be opened. Please upload the Excel (.xls / .xlsx) or CSV file exactly as exported.');
   }
@@ -30,13 +33,14 @@ export function readGrid(buffer, fileName = '') {
 }
 
 // Rows with at least one value inside the sheet's range (the same rows sheet_to_json would return as filled).
-// In dense mode each row is an array of cells at ws[rowIndex].
+// In dense mode each row is an array of cells: at ws['!data'][row] in SheetJS 0.20+ (ws[row] in 0.18).
 function filledRows(ws) {
   if (!ws?.['!ref']) return 0;
   const r = XLSX.utils.decode_range(ws['!ref']);
+  const data = ws['!data'] || ws;
   let n = 0;
   for (let R = r.s.r; R <= r.e.r; R++) {
-    const row = ws[R];
+    const row = data[R];
     if (!row) continue;
     for (let C = r.s.c; C <= r.e.c; C++) if (row[C] && !isEmpty(row[C].v)) { n++; break; }
   }

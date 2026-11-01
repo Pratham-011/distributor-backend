@@ -1,4 +1,4 @@
--- Distributor Reports schema.
+-- Reportly schema.
 -- Run once in the Supabase SQL editor (the server also runs it on start; every statement is idempotent).
 
 create table if not exists organizations (
@@ -11,7 +11,7 @@ create table if not exists organizations (
 create table if not exists users (
   id            uuid primary key default gen_random_uuid(),
   org_id        uuid not null references organizations(id) on delete cascade,
-  email         text not null unique,
+  email         text not null,
   name          text not null,
   password_hash text not null,
   role          text not null check (role in ('viewer','writer','admin','owner')),
@@ -237,6 +237,47 @@ create table if not exists usage_blocks (
 );
 create index if not exists usage_blocks_q on usage_blocks (org_id, day);
 
+-- ---- seats, linked companies, sessions, platform settings and expenses ----
+-- seats: 1 owner + included_users are in the plan (platform_settings); extra_users are bought on top
+alter table organizations add column if not exists extra_users int not null default 0;
+-- a second company bought by the same customer: its parent is the first company (billing is on the parent)
+alter table organizations add column if not exists parent_org_id uuid references organizations(id) on delete set null;
+alter table organizations add column if not exists trial boolean not null default false;      -- self-signed-up, not paid yet
+
+-- one row per sign-in. A user can have only one live session (one device at a time).
+create table if not exists sessions (
+  id           uuid primary key default gen_random_uuid(),
+  user_id      uuid not null references users(id) on delete cascade,
+  org_id       uuid not null references organizations(id) on delete cascade,
+  created_at   timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  ip           text,
+  user_agent   text,
+  revoked_at   timestamptz,
+  revoked_why  text          -- logout | other_device | admin | password | access_off
+);
+create index if not exists sessions_user on sessions (user_id, revoked_at);
+create index if not exists sessions_org on sessions (org_id, created_at desc);
+
+create table if not exists platform_settings (
+  key   text primary key,
+  value jsonb not null
+);
+create table if not exists platform_expenses (
+  id          uuid primary key default gen_random_uuid(),
+  spent_on    date not null,
+  category    text not null,            -- hosting | database | domain | email | support | marketing | tools | other
+  vendor      text,
+  amount      numeric(12,2) not null,
+  repeat      text,                      -- null = once, 'monthly' = every month from spent_on until ends_on
+  ends_on     date,
+  note        text,
+  created_by  text,
+  created_at  timestamptz not null default now()
+);
+create index if not exists platform_expenses_q on platform_expenses (spent_on desc);
+alter table org_payments drop constraint if exists org_payments_kind_check;
+
 -- everything people do in the app, newest first
 create table if not exists activity_log (
   id          bigserial primary key,
@@ -250,6 +291,35 @@ create table if not exists activity_log (
   created_at  timestamptz not null default now()
 );
 create index if not exists activity_log_q on activity_log (org_id, id desc);
+
+-- ---- one person in several businesses, business profile, requests ----
+-- The same email can have a row in each business it belongs to (own role, own seat); the rows share one password.
+alter table users drop constraint if exists users_email_key;
+create unique index if not exists users_org_email on users (org_id, email);
+create index if not exists users_email on users (email);
+
+alter table organizations add column if not exists address text;
+alter table organizations add column if not exists gstin text;
+alter table organizations add column if not exists phone text;
+alter table organizations add column if not exists contact_email text;
+
+-- what customers ask for: another business, another person, help, a bug. Also emailed to the support inbox.
+create table if not exists requests (
+  id          uuid primary key default gen_random_uuid(),
+  org_id      uuid not null references organizations(id) on delete cascade,
+  user_id     uuid references users(id) on delete set null,
+  kind        text not null,                    -- add_business | add_user | support | bug | other
+  subject     text not null,
+  message     text not null default '',
+  payload     jsonb not null default '{}'::jsonb,
+  status      text not null default 'new' check (status in ('new','in_progress','done','rejected')),
+  admin_note  text,
+  emailed     boolean not null default false,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+create index if not exists requests_org on requests (org_id, created_at desc);
+create index if not exists requests_status on requests (status, created_at desc);
 
 -- The app talks to Postgres directly from the server. Turning on row level security with no policies
 -- blocks Supabase's public REST API (anon / authenticated keys) from reading these tables at all.
@@ -266,3 +336,7 @@ alter table activity_log      enable row level security;
 alter table stock_items       enable row level security;
 alter table org_payments      enable row level security;
 alter table usage_blocks      enable row level security;
+alter table sessions          enable row level security;
+alter table platform_settings enable row level security;
+alter table platform_expenses enable row level security;
+alter table requests          enable row level security;

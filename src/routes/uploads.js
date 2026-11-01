@@ -5,7 +5,7 @@ import { Router } from 'express';
 import multer from 'multer';
 import { db, bulkInsert } from '../db.js';
 import { requireAuth, requireRole, hasRole } from '../auth.js';
-import { HttpError, wrap } from '../http.js';
+import { HttpError, wrap, uuidParam } from '../http.js';
 import { logActivity, periodText } from '../activity.js';
 import { putFile, getFile, removeFile } from '../storage.js';
 import { REPORT_TYPES, TYPE_LIST, suggestMapping } from '../excel/reportTypes.js';
@@ -21,6 +21,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX
 
 export const uploadsRouter = Router();
 uploadsRouter.use(requireAuth);
+uploadsRouter.param('id', uuidParam);
 
 // ---------- helpers ----------
 async function saveTmp(orgId, file) {
@@ -492,6 +493,7 @@ async function takeOut(req, u, finalStatus) {
 // ---------- saved formats ----------
 export const templatesRouter = Router();
 templatesRouter.use(requireAuth);
+templatesRouter.param('id', uuidParam);
 templatesRouter.get('/', wrap(async (req, res) => {
   res.json({ templates: (await db.query(
     `select t.id, t.report_type, t.name, t.headers, t.header_row, t.mapping, t.date_format, t.times_used, t.updated_at, u.name created_by

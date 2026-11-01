@@ -39,7 +39,10 @@ if (url.startsWith('pglite:')) {
   pgLib.types.setTypeParser(INT8, v => Number(v));
   const pool = new pgLib.Pool({
     connectionString: url,
-    ssl: url.includes('localhost') || url.includes('127.0.0.1') ? false : { rejectUnauthorized: false },
+    // DATABASE_SSL_CA = the database's certificate authority as PEM text (a literal \n is accepted for line breaks):
+    // the connection is then fully verified. Without it the connection is encrypted but the server's identity is not checked.
+    ssl: url.includes('localhost') || url.includes('127.0.0.1') ? false
+      : process.env.DATABASE_SSL_CA ? { ca: process.env.DATABASE_SSL_CA.replace(/\\n/g, '\n'), rejectUnauthorized: true } : { rejectUnauthorized: false },
     max: 10,
   });
   impl = {
