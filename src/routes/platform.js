@@ -21,7 +21,7 @@ export const PERIOD_MONTHS = { monthly: 1, quarterly: 3, half_yearly: 6, yearly:
 const ONLINE_MIN = 5;
 const IDLE_HOURS = Number(process.env.SESSION_IDLE_HOURS) || 8;
 // tables that hold a business's data; size per business = the exact stored size of its rows
-const DATA_TABLES = ['doc_lines', 'receipts', 'outstanding_bills', 'stock_items', 'uploads', 'mapping_templates', 'activity_log', 'usage_blocks', 'org_payments', 'sessions'];
+const DATA_TABLES = ['doc_lines', 'receipts', 'outstanding_bills', 'stock_items', 'uploads', 'mapping_templates', 'activity_log', 'usage_blocks', 'org_payments', 'sessions', 'settled_bills'];
 const PAYMENT_KINDS = ['setup', 'subscription', 'extra_user', 'extra_company', 'other'];
 const EXPENSE_CATEGORIES = ['hosting', 'database', 'domain', 'email', 'support', 'marketing', 'tools', 'salary', 'other'];
 
@@ -126,7 +126,7 @@ platformRouter.get('/orgs/:id', wrap(async (req, res) => {
   for (const u of users) { u.signed_in = u.device != null; u.device = u.device != null ? deviceOf(u.device) : null; }
   for (const s of sessions) { s.device = deviceOf(s.user_agent); delete s.user_agent; }
   const LABEL = { doc_lines: 'Sales, purchase and note lines', receipts: 'Receipts', outstanding_bills: 'Outstanding bills', stock_items: 'Stock statement rows',
-    uploads: 'Uploaded files (records)', mapping_templates: 'Saved file formats', activity_log: 'Activity log', usage_blocks: 'Usage records', org_payments: 'Payments', sessions: 'Sign-in records' };
+    uploads: 'Uploaded files (records)', mapping_templates: 'Saved file formats', activity_log: 'Activity log', usage_blocks: 'Usage records', org_payments: 'Payments', sessions: 'Sign-in records', settled_bills: 'Settled bills' };
   const c = counts[orgId] || {};
   const data = DATA_TABLES.map(t => ({ name: LABEL[t], rows: c[t]?.n || 0, bytes: c[t]?.b || 0 })).filter(x => x.rows);
   res.json({ users, payments, data, daily, linked, sessions });

@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import XLSX from 'xlsx';
 
+XLSX.set_fs(fs);   // the ES-module build of SheetJS writes files only after it is given fs
+
 export function makeFixtures(dir) {
   fs.mkdirSync(dir, { recursive: true });
   let seed = 7;

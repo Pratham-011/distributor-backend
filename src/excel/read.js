@@ -66,6 +66,7 @@ export function detectType(banner, headers) {
   for (const t of Object.values(REPORT_TYPES)) if (t.titles.some(x => text.includes(x))) return t.key;
   // fall back to header shape
   const h = new Set(headers.map(norm));
+  if (h.has('billno') && h.has('series') && h.has('cash') && h.has('cheque') && h.has('credit') && h.has('partyname')) return 'delivery';
   if (h.has('crntype')) return 'credit_note';
   if (h.has('creditaccount') && h.has('debitaccount')) return 'receipt';
   if (h.has('balance') && h.has('billamount')) return 'outstanding';
@@ -82,6 +83,10 @@ export function periodOf(banner) {
   if (m) return { from: `${m[3]}-${pad(m[2])}-${pad(m[1])}`, to: `${m[6]}-${pad(m[5])}-${pad(m[4])}` };
   m = text.match(/As\s*On\s*(?:Date)?\s*:?\s*(\d{1,2})[/-](\d{1,2})[/-](\d{4})/i);
   if (m) { const d = `${m[3]}-${pad(m[2])}-${pad(m[1])}`; return { from: d, to: d }; }
+  // Delivery Report Collection: "Load No: 1554   Date : 12/11/2026" (and more load lines, each with a date)
+  const loads = [...text.matchAll(/load\s*no\s*:?\s*\d+[^|]*?date\s*:?\s*(\d{1,2})[/-](\d{1,2})[/-](\d{4})/gi)]
+    .map(x => `${x[3]}-${pad(x[2])}-${pad(x[1])}`).sort();
+  if (loads.length) return { from: loads[0], to: loads[loads.length - 1], loads: [...text.matchAll(/load\s*no\s*:?\s*(\d+)/gi)].map(x => x[1]) };
   return { from: null, to: null };
 }
 

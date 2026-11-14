@@ -106,6 +106,7 @@ export function applyMapping(typeKey, body, mapping, { dateFormat = 'DMY', banne
         (bad[f.label] ||= []).push(r._row);
       }
     }
+    if (T.keepRow && !T.keepRow(rec)) continue;     // summary / separator rows that are not data (Delivery Report Collection)
     if (!rec[docKey]) { if (Object.keys(rec).length > 2) skipped.push(r._row); continue; }
     out.push(rec);
   }
@@ -147,6 +148,7 @@ export function applyMapping(typeKey, body, mapping, { dateFormat = 'DMY', banne
   if (typeKey === 'receipt') receiptChecks(out, issues);
   if (typeKey === 'outstanding') outstandingChecks(out, issues);
   if (typeKey === 'stock') stockChecks(out, mapping, issues);
+  if (typeKey === 'delivery') deliveryChecks(out, banner, issues);
 
   // ---- period ----
   // snapshots (Outstanding, Stock) are "as on" one date, taken from the title rows; registers cover their row dates
@@ -163,6 +165,14 @@ export function applyMapping(typeKey, body, mapping, { dateFormat = 'DMY', banne
     } else if (!d) {
       issues.push(issue('error', 'Could not find the "As on" date at the top of this file.'));
     }
+  } else if (typeKey === 'delivery') {
+    // no date column: the load date(s) printed at the top of the file
+    period = { from: banner.from || null, to: banner.to || null };
+    if (!period.from) {
+      const today = new Date().toISOString().slice(0, 10);
+      period = { from: today, to: today };
+      issues.push(issue('warning', `No load date at the top of this file, so it is saved with today's date (${today.split('-').reverse().join('/')}). The bills are still marked settled.`));
+    }
   } else {
     const dateKey = T.fields.find(f => f.required && f.kind === 'date').key;
     const dates = out.map(r => r[dateKey]).filter(Boolean).sort();
@@ -175,6 +185,7 @@ export function applyMapping(typeKey, body, mapping, { dateFormat = 'DMY', banne
   const sumOf = k => out.reduce((a, r) => a.plus(r[k] || Z), Z).toFixed(2);
   const stats = { rows: out.length, ...(T.table === 'doc_lines' ? { taxable: sumOf('taxable'), docs: new Set(out.map(r => r.doc_no)).size }
     : typeKey === 'receipt' ? { amount: sumOf('amount') }
+      : typeKey === 'delivery' ? { bills: new Set(out.map(r => r.bill_key)).size, amount: sumOf('bill_amount'), cancelled: out.filter(r => r.bill_amount.isZero()).length }
       : typeKey === 'stock' ? { items: new Set(out.map(r => r.sku_code)).size, stock_qty: sumOf('closing_qty'), ...(mapping.value || mapping.rate ? { stock_value: sumOf('value') } : {}) }
         : { balance: sumOf('balance') }) };
   // decimals -> exact strings for Postgres, in place (a second copy of every row would double the memory)
@@ -361,6 +372,26 @@ function stockChecks(out, mapping, issues) {
   if (!mapping.value && !mapping.rate) {
     issues.push(issue('warning', 'This file has no value or rate column, so stock value will be worked out from your latest purchase rates.'));
   }
+}
+
+// The key a bill is matched on everywhere: series + number, letters and digits only ("A\15727" -> "A15727").
+export const billKey = s => String(s ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+function deliveryChecks(out, banner, issues) {
+  const seen = new Map(), dup = [];
+  const loads = (banner.loads || []).join(', ') || null;
+  for (const r of out) {
+    const no = String(r.bill_no).trim();
+    const ref = billKey(r.bill_ref);
+    // the printed "A\15727" is what the billing software calls the bill; otherwise series + number
+    r.bill_key = ref && ref.endsWith(no) ? ref : billKey(`${r.series || ''}${no}`);
+    r.series = billKey(r.series) || null;
+    r.load_no = loads;
+    if (seen.has(r.bill_key)) dup.push(r.row_no, seen.get(r.bill_key)); else seen.set(r.bill_key, r.row_no);
+  }
+  if (dup.length) issues.push(issue('warning', 'The same bill appears more than once in this file', [...new Set(dup)]));
+  const off = out.filter(r => r.cash.plus(r.cheque).plus(r.credit).plus(r.pending).minus(r.bill_amount).abs().gt(ROUND_OFF_MAX)).map(r => r.row_no);
+  if (off.length) issues.push(issue('warning', 'Cash + Cheque + Credit + Pending is not equal to the Bill amount on some bills', off));
 }
 
 function outstandingChecks(out, issues) {

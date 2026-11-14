@@ -100,6 +100,28 @@ export const REPORT_TYPES = {
       { key: 'salesman', label: 'Salesman', kind: 'text', match: ['salesmanname', 'salesman'] },
     ],
   },
+  // Delivery Report Collection: the bills that were delivered and settled (one file per load). It does not add sales of its
+  // own; it tells the reports which bills are "settled". A bill is settled when its number appears in any uploaded file.
+  // Files add up (several loads on one day), so a new file never replaces an earlier one unless it is the very same file.
+  delivery: {
+    key: 'delivery', label: 'Delivery Report Collection', short: 'Settled bills', table: 'settled_bills', additive: true,
+    titles: ['delivery report collection'],
+    // the file also holds #LINE and summary rows (CASH BILLS 22 ...): only rows with a bill number are bills
+    keepRow: rec => /^\d+$/.test(String(rec.bill_no || '').trim()),
+    fields: [
+      { key: 'bill_no', label: 'Bill number', kind: 'text', required: true, match: ['billno'] },
+      { key: 'series', label: 'Series (A, Z ...; empty = numbers only)', kind: 'text', match: ['series'] },
+      { key: 'bill_ref', label: 'Bill number with series (like A\\15727)', kind: 'text', match: ['billno2'] },
+      { key: 'party_name', label: 'Party name', kind: 'text', match: ['partyname'] },
+      { key: 'bill_amount', label: 'Bill amount', kind: 'money', required: true, match: ['billamt', 'billamount'] },
+      { key: 'cash', label: 'Cash', kind: 'money', match: ['cash'] },
+      { key: 'cheque', label: 'Cheque', kind: 'money', match: ['cheque'] },
+      { key: 'credit', label: 'Credit', kind: 'money', match: ['credit'] },
+      { key: 'pending', label: 'Pending', kind: 'money', match: ['pending'] },
+      { key: 'scheme', label: 'Scheme', kind: 'money', match: ['scheme'] },
+      { key: 'cd', label: 'Cash discount (CD)', kind: 'money', match: ['cd'] },
+    ],
+  },
   // Closing stock / stock summary, "as on" a date (like Outstanding). Batch-wise files are fine: rows are added up per item.
   stock: {
     key: 'stock', label: 'Stock Statement', short: 'Stock', table: 'stock_items', snapshot: true,

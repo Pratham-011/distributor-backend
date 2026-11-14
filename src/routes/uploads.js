@@ -81,7 +81,8 @@ async function overlapInfo(orgId, type, period, hash) {
   const dup = (await db.query(
     `select id, created_at, file_name from uploads where org_id=$1 and file_hash=$2 and status='active' limit 1`, [orgId, hash])).rows[0];
   let existing = [];
-  if (period.from && period.to) {
+  // settled-bill files add up (many loads a day): only the very same file counts as a repeat
+  if (period.from && period.to && !REPORT_TYPES[type]?.additive) {
     existing = (await db.query(
       `select id, file_name, period_from, period_to, created_at, row_count from uploads
        where org_id=$1 and report_type=$2 and status='active' and period_from <= $4 and period_to >= $3
@@ -235,7 +236,7 @@ async function commitFile(req, res, { token, report_type, header_row, mapping, d
       }
 
       // 2. replace earlier data for the same dates
-      const rep = await replaceExisting(t, orgId, report_type, r.period);
+      const rep = await replaceExisting(t, orgId, report_type, r.period, hash);
 
       // 3. upload record
       await t.query(
@@ -270,7 +271,16 @@ async function commitFile(req, res, { token, report_type, header_row, mapping, d
 // Where a file is in the line (the browser asks while it waits for an upload, check or save)
 uploadsRouter.get('/progress/:job', (req, res) => res.json(jobState(req.params.job)));
 
-async function replaceExisting(t, orgId, type, period) {
+async function replaceExisting(t, orgId, type, period, hash) {
+  if (REPORT_TYPES[type].additive) {
+    // files of this kind add up: uploading the very same file again replaces its earlier copy, nothing else
+    const same = (await t.query(`select id, file_name from uploads where org_id=$1 and report_type=$2 and status='active' and file_hash=$3`, [orgId, type, hash])).rows;
+    for (const o of same) {
+      await t.query(`delete from ${REPORT_TYPES[type].table} where upload_id=$1`, [o.id]);
+      await t.query(`update uploads set row_count=0, status='replaced' where id=$1`, [o.id]);
+    }
+    return same.map(o => o.file_name);
+  }
   if (!period.from || !period.to) return [];
   const olds = (await t.query(
     `select id, file_name from uploads where org_id=$1 and report_type=$2 and status='active' and period_from <= $4 and period_to >= $3`,
@@ -302,6 +312,12 @@ async function insertRows(t, T, orgId, uploadId, type, r) {
       if (o.gstin) o.gstin = o.gstin.toUpperCase();
       return o;
     }), 300);
+  } else if (type === 'delivery') {
+    await bulkInsert(t, 'settled_bills', r.rows.map(x => ({
+      org_id: orgId, upload_id: uploadId, row_no: x.row_no, bill_key: x.bill_key, series: x.series ?? null, bill_no: x.bill_no,
+      party_name: x.party_name ?? null, bill_amount: x.bill_amount ?? '0', cash: x.cash ?? '0', cheque: x.cheque ?? '0', credit: x.credit ?? '0',
+      pending: x.pending ?? '0', scheme: x.scheme ?? '0', cd: x.cd ?? '0', load_no: x.load_no ?? null, settled_on: r.period.to,
+    })), 500);
   } else if (type === 'receipt') {
     await bulkInsert(t, 'receipts', r.rows.map(x => ({
       org_id: orgId, upload_id: uploadId, row_no: x.row_no, v_date: x.v_date, v_no: x.v_no, party_code: x.party_code ?? null,
@@ -354,7 +370,7 @@ uploadsRouter.get('/:id/download', wrap(async (req, res) => {
 // stored original file. Days that a later upload has since taken over are left alone.
 // The undone upload's own file is kept, so it can still be downloaded.
 
-const ROW_DATE = { doc_lines: 'doc_date', receipts: 'v_date', outstanding_bills: 'as_on', stock_items: 'as_on' };
+const ROW_DATE = { doc_lines: 'doc_date', receipts: 'v_date', outstanding_bills: 'as_on', stock_items: 'as_on', settled_bills: 'settled_on' };
 
 function daysOf(from, to) {
   const out = [];
@@ -445,7 +461,8 @@ async function takeOut(req, u, finalStatus) {
   // which earlier upload owned each day before this one replaced it.
   // Uploads taken out with undo/delete (undone_at set) already gave their days back, so they don't count.
   const restore = new Map();   // upload id -> { prev, days }
-  if (u.period_from && u.period_to) {
+  // files that add up (settled bills) never replaced anything, so there is nothing to bring back
+  if (u.period_from && u.period_to && !T.additive) {
     const others = (await db.query(
       `select * from uploads where org_id=$1 and report_type=$2 and id<>$3 and undone_at is null
          and period_from <= $5 and period_to >= $4 order by created_at`,

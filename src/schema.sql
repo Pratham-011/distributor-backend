@@ -321,6 +321,32 @@ create table if not exists requests (
 create index if not exists requests_org on requests (org_id, created_at desc);
 create index if not exists requests_status on requests (status, created_at desc);
 
+-- ---- settled bills (from the Delivery Report Collection files) ----
+-- A bill is "settled" when it appears here. bill_key = series + number, letters and digits only
+-- ("A15727", "Z58643", "37835"), the same form the Sales Register's invoice number reduces to.
+-- Several files can list bills for the same day (one per load), so rows belong to their upload and add up.
+create table if not exists settled_bills (
+  id          bigserial primary key,
+  org_id      uuid not null references organizations(id) on delete cascade,
+  upload_id   uuid not null references uploads(id) on delete cascade,
+  row_no      int not null,
+  bill_key    text not null,
+  series      text,
+  bill_no     text not null,
+  party_name  text,
+  bill_amount numeric(14,2) not null default 0,
+  cash        numeric(14,2) not null default 0,
+  cheque      numeric(14,2) not null default 0,
+  credit      numeric(14,2) not null default 0,
+  pending     numeric(14,2) not null default 0,
+  scheme      numeric(14,2) not null default 0,
+  cd          numeric(14,2) not null default 0,
+  load_no     text,
+  settled_on  date
+);
+create index if not exists settled_bills_key on settled_bills (org_id, bill_key);
+create index if not exists settled_bills_upload on settled_bills (upload_id);
+
 -- The app talks to Postgres directly from the server. Turning on row level security with no policies
 -- blocks Supabase's public REST API (anon / authenticated keys) from reading these tables at all.
 alter table organizations     enable row level security;
@@ -340,3 +366,4 @@ alter table sessions          enable row level security;
 alter table platform_settings enable row level security;
 alter table platform_expenses enable row level security;
 alter table requests          enable row level security;
+alter table settled_bills     enable row level security;

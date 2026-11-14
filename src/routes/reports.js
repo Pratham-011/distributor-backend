@@ -17,22 +17,41 @@ function range(req) {
 const q = async (sql, p) => (await db.query(sql, p)).rows;
 const one = async (sql, p) => (await db.query(sql, p)).rows[0];
 
-// Common WHERE for a doc type in a date range: $1 org, $2 from, $3 to
-const W = type => `org_id=$1 and doc_type='${type}' and doc_date between $2 and $3`;
+// ---- settled / unsettled ----
+// A bill is "settled" when its number is in a Delivery Report Collection file (table settled_bills). Numbers are compared as
+// series + number, letters and digits only, so "A/15728", "A\\15728" and "A15728" are the same bill. ?settle=settled|unsettled
+// narrows the sales, credit-note, GST and outstanding numbers; anything else shows every bill. Purchases are never split.
+// (translate() drops the separators; the settled keys are looked up once per query, not once per row, so big files stay fast)
+const KEY = col => `coalesce(translate(upper(${col}), '/\\ .-_', ''), '')`;
+// ("is true" / "is not true" keep Postgres from turning the lookup into a row-by-row join, which is very slow on big files)
+const IS_SETTLED = col => `(${KEY(col)} in (select sb.bill_key from settled_bills sb where sb.org_id=$1))`;
+const settleOf = req => (['settled', 'unsettled'].includes(req.query.settle) ? req.query.settle : 'all');
+const settleSql = (s, col) => (s === 'settled' ? ` and ${IS_SETTLED(col)} is true` : s === 'unsettled' ? ` and ${IS_SETTLED(col)} is not true` : '');
 
-async function docTotals(type, p) {
+// For queries over every kind of line at once (stock): sales by their own number, credit notes by the bill they were
+// raised against; purchases and debit notes always count.
+const LINES = s => (s === 'all' ? '' : ` and (doc_lines.doc_type in ('purchase','debit_note')
+  or (doc_lines.doc_type='sales' and ${IS_SETTLED('doc_lines.doc_no')} is ${s === 'settled' ? '' : 'not '}true)
+  or (doc_lines.doc_type='credit_note' and ${IS_SETTLED('doc_lines.ref_no')} is ${s === 'settled' ? '' : 'not '}true))`);
+
+// Common WHERE for a doc type in a date range: $1 org, $2 from, $3 to.
+// A credit note follows the bill it was raised against (Ref. Inv No); purchases and debit notes are always counted.
+const W = (type, s = 'all') => `org_id=$1 and doc_type='${type}' and doc_date between $2 and $3` +
+  (type === 'sales' ? settleSql(s, 'doc_lines.doc_no') : type === 'credit_note' ? settleSql(s, 'doc_lines.ref_no') : '');
+
+async function docTotals(type, p, s = 'all') {
   return one(`
     select count(*)::int lines, count(distinct doc_no)::int docs, count(distinct party_code)::int parties,
            coalesce(sum(qty),0) qty, coalesce(sum(amount),0) gross, coalesce(sum(discount),0) discount,
            coalesce(sum(taxable),0) taxable, coalesce(sum(cgst),0) cgst, coalesce(sum(sgst),0) sgst,
            coalesce(sum(igst),0) igst, coalesce(sum(cess),0) cess,
            coalesce(sum(cgst+sgst+igst+cess),0) tax,
-           (select coalesce(sum(v),0) from (select max(doc_value) v from doc_lines where ${W(type)} group by doc_no) d) value
-    from doc_lines where ${W(type)}`, p);
+           (select coalesce(sum(v),0) from (select max(doc_value) v from doc_lines where ${W(type, s)} group by doc_no) d) value
+    from doc_lines where ${W(type, s)}`, p);
 }
 
-const byBrand = (type, p, limit = 50) => q(`
-  select brand name, sum(qty) qty, sum(taxable) taxable from doc_lines where ${W(type)}
+const byBrand = (type, p, limit = 50, s = 'all') => q(`
+  select brand name, sum(qty) qty, sum(taxable) taxable from doc_lines where ${W(type, s)}
   group by brand order by sum(taxable) desc limit ${limit}`, p);
 
 async function latestSnapshot(orgId, onOrBefore) {
@@ -45,16 +64,17 @@ const BUCKETS = `case when age_weeks <= 1 then '0-1 week' when age_weeks <= 4 th
   when age_weeks <= 8 then '5-8 weeks' when age_weeks <= 12 then '9-12 weeks' else 'Over 12 weeks' end`;
 const BUCKET_ORDER = ['0-1 week', '2-4 weeks', '5-8 weeks', '9-12 weeks', 'Over 12 weeks'];
 
-async function outstandingSummary(orgId, asOn) {
+async function outstandingSummary(orgId, asOn, s = 'all') {
   if (!asOn) return null;
   const p = [orgId, asOn];
+  const S = settleSql(s, 'outstanding_bills.bill_no');
   const t = await one(`select count(*)::int bills, count(distinct coalesce(party_code, party_name))::int parties,
       coalesce(sum(balance),0) total, coalesce(sum(balance) filter (where age_weeks > 4),0) over_4,
       coalesce(sum(balance) filter (where age_weeks > 8),0) over_8,
       count(distinct coalesce(party_code, party_name)) filter (where age_weeks > 8)::int over_8_parties
-    from outstanding_bills where org_id=$1 and as_on=$2`, p);
+    from outstanding_bills where org_id=$1 and as_on=$2${S}`, p);
   const b = await q(`select ${BUCKETS} name, count(*)::int bills, sum(balance) balance from outstanding_bills
-    where org_id=$1 and as_on=$2 group by 1`, p);
+    where org_id=$1 and as_on=$2${S} group by 1`, p);
   t.buckets = BUCKET_ORDER.map(n => b.find(x => x.name === n) || { name: n, bills: 0, balance: '0' });
   t.as_on = asOn;
   return t;
@@ -68,6 +88,7 @@ reportsRouter.get('/dates', wrap(async (req, res) => {
     union all select 'receipt', v_date::text from receipts where org_id=$1 group by 2
     union all select 'outstanding', as_on::text from outstanding_bills where org_id=$1 group by 2
     union all select 'stock', as_on::text from stock_items where org_id=$1 group by 2
+    union all select 'delivery', settled_on::text from settled_bills where org_id=$1 group by 2
     order by 2 desc`, [org]);
   const latest = {};
   const days = {};
@@ -80,43 +101,81 @@ reportsRouter.get('/dates', wrap(async (req, res) => {
 
 // ---------- overview ----------
 reportsRouter.get('/overview', wrap(async (req, res) => {
-  const p = range(req);
-  const [sales, cn, purchase, dn] = await Promise.all(['sales', 'credit_note', 'purchase', 'debit_note'].map(t => docTotals(t, p)));
+  const p = range(req), s = settleOf(req);
+  const [sales, cn, purchase, dn] = await Promise.all(['sales', 'credit_note', 'purchase', 'debit_note'].map(t => docTotals(t, p, s)));
   const receipts = await one(`select count(*)::int n, coalesce(sum(amount),0) total,
       coalesce(sum(amount) filter (where mode='Cash'),0) cash, coalesce(sum(amount) filter (where mode<>'Cash'),0) bank
     from receipts where org_id=$1 and v_date between $2 and $3`, p);
   const asOn = await latestSnapshot(p[0], p[2]) || await latestSnapshot(p[0]);   // outstanding is a position: show the nearest one we have
   const daily = await q(`
     select d::text date, coalesce(s.taxable,0) sales, coalesce(r.amount,0) collected from
-      (select doc_date d from doc_lines where ${W('sales')} union select v_date from receipts where org_id=$1 and v_date between $2 and $3) days
-      left join (select doc_date, sum(taxable) taxable from doc_lines where ${W('sales')} group by 1) s on s.doc_date=days.d
+      (select doc_date d from doc_lines where ${W('sales', s)} union select v_date from receipts where org_id=$1 and v_date between $2 and $3) days
+      left join (select doc_date, sum(taxable) taxable from doc_lines where ${W('sales', s)} group by 1) s on s.doc_date=days.d
       left join (select v_date, sum(amount) amount from receipts where org_id=$1 and v_date between $2 and $3 group by 1) r on r.v_date=days.d
     order by 1`, p);
   res.json({
     sales, credit_note: cn, purchase, debit_note: dn, receipts,
     net_sales: (await one(`select ($1::numeric - $2::numeric) v`, [sales.taxable, cn.taxable])).v,
-    outstanding: await outstandingSummary(p[0], asOn),
-    brands: await byBrand('sales', p, 8),
+    outstanding: await outstandingSummary(p[0], asOn, s),
+    brands: await byBrand('sales', p, 8, s),
     daily,
   });
 }));
 
+// ---------- settled / unsettled summary ----------
+// For the dates chosen: sales bills, credit notes and (the latest) outstanding, split into settled and unsettled,
+// plus whether any Delivery Report Collection file has been uploaded at all.
+reportsRouter.get('/settlement', wrap(async (req, res) => {
+  const p = range(req);
+  const org = p[0];
+  const files = await one(`select count(distinct bill_key)::int bills, count(distinct upload_id)::int files, max(settled_on)::text latest from settled_bills where org_id=$1`, [org]);
+  const split = async type => {
+    const row = async s => one(`select count(distinct doc_no)::int bills, coalesce(sum(taxable),0) taxable from doc_lines where ${W(type, s)}`, p);
+    const [settled, unsettled] = await Promise.all([row('settled'), row('unsettled')]);
+    return { settled, unsettled };
+  };
+  const [sales, credit_note] = await Promise.all([split('sales'), split('credit_note')]);
+  res.json({ has_files: files.files > 0, settled_bills: files.bills, files: files.files, latest_load: files.latest, sales, credit_note });
+}));
+
+// Every bill in the Delivery Report Collection files loaded on the chosen dates, looked up in the Sales Register
+// (any date): found with the same bill amount, found with a different amount, or not in any uploaded Sales Register.
+reportsRouter.get('/settlement/check', wrap(async (req, res) => {
+  const p = range(req);
+  const rows = await q(`
+    with sb as (
+      select distinct on (bill_key) bill_key, bill_no, series, party_name, bill_amount, cash, cheque, credit, load_no, settled_on
+      from settled_bills where org_id=$1 and settled_on between $2 and $3 order by bill_key, settled_on desc),
+    reg as (
+      select ${KEY('doc_lines.doc_no')} k, max(doc_no) doc_no, max(doc_date)::text date, max(party_name) party, max(doc_value) value
+      from doc_lines where org_id=$1 and doc_type='sales'
+        and (${KEY('doc_lines.doc_no')} in (select bill_key from sb)) is true
+      group by 1)
+    select sb.bill_key, sb.series, sb.bill_no, sb.party_name, sb.bill_amount, sb.cash, sb.cheque, sb.credit, sb.load_no, sb.settled_on::text settled_on,
+           reg.doc_no reg_no, reg.date reg_date, reg.party reg_party, reg.value reg_value,
+           case when reg.k is null then 'missing' when abs(reg.value - sb.bill_amount) <= 1 then 'match' else 'differs' end status
+    from sb left join reg on reg.k = sb.bill_key
+    order by case when reg.k is null then 1 when abs(reg.value - sb.bill_amount) <= 1 then 3 else 2 end, sb.settled_on, sb.bill_key`, p);
+  const count = st => rows.filter(r => r.status === st).length;
+  res.json({ summary: { bills: rows.length, match: count('match'), differs: count('differs'), missing: count('missing') }, rows: rows.slice(0, 5000) });
+}));
+
 // ---------- sales ----------
 reportsRouter.get('/sales', wrap(async (req, res) => {
-  const p = range(req);
-  const totals = await docTotals('sales', p);
+  const p = range(req), s = settleOf(req);
+  const totals = await docTotals('sales', p, s);
   const [brands, series, b2b, parties, skus, daily] = await Promise.all([
-    byBrand('sales', p),
+    byBrand('sales', p, 50, s),
     q(`select coalesce(nullif(substring(doc_no from '^[A-Za-z]+'),''),'Numbers only') name, count(distinct doc_no)::int invoices, sum(taxable) taxable
-       from doc_lines where ${W('sales')} group by 1 order by 3 desc`, p),
+       from doc_lines where ${W('sales', s)} group by 1 order by 3 desc`, p),
     q(`select coalesce(gstr1_section, case when gstin is null then 'B2C' else 'B2B' end) name, count(distinct doc_no)::int invoices,
           sum(taxable) taxable, sum(cgst+sgst+igst+cess) tax
-       from doc_lines where ${W('sales')} group by 1 order by 1`, p),
+       from doc_lines where ${W('sales', s)} group by 1 order by 1`, p),
     q(`select party_code code, max(party_name) name, count(distinct doc_no)::int bills, sum(qty) qty, sum(taxable) taxable
-       from doc_lines where ${W('sales')} group by party_code order by sum(taxable) desc limit 25`, p),
+       from doc_lines where ${W('sales', s)} group by party_code order by sum(taxable) desc limit 25`, p),
     q(`select sku_code code, max(sku_name) name, max(brand) brand, sum(qty) qty, sum(taxable) taxable
-       from doc_lines where ${W('sales')} group by sku_code order by sum(taxable) desc limit 25`, p),
-    q(`select doc_date::text date, sum(taxable) taxable, count(distinct doc_no)::int invoices from doc_lines where ${W('sales')} group by 1 order by 1`, p),
+       from doc_lines where ${W('sales', s)} group by sku_code order by sum(taxable) desc limit 25`, p),
+    q(`select doc_date::text date, sum(taxable) taxable, count(distinct doc_no)::int invoices from doc_lines where ${W('sales', s)} group by 1 order by 1`, p),
   ]);
   res.json({ totals, brands, series, b2b, parties, skus, daily,
     round_off: (await one(`select ($1::numeric - $2::numeric - $3::numeric) v`, [totals.value, totals.taxable, totals.tax])).v });
@@ -124,30 +183,30 @@ reportsRouter.get('/sales', wrap(async (req, res) => {
 
 // ---------- GST ----------
 reportsRouter.get('/gst', wrap(async (req, res) => {
-  const p = range(req);
-  const [sales, cn, purchase, dn] = await Promise.all(['sales', 'credit_note', 'purchase', 'debit_note'].map(t => docTotals(t, p)));
+  const p = range(req), s = settleOf(req);
+  const [sales, cn, purchase, dn] = await Promise.all(['sales', 'credit_note', 'purchase', 'debit_note'].map(t => docTotals(t, p, s)));
   const pos = await one(`select ($1::numeric - $2::numeric) net_output, ($3::numeric - $4::numeric) net_input,
      ($1::numeric - $2::numeric) - ($3::numeric - $4::numeric) position`, [sales.tax, cn.tax, purchase.tax, dn.tax]);
   const hsn = await q(`select hsn, string_agg(distinct brand, ', ') brands, sum(qty) qty, sum(taxable) taxable,
       sum(cgst) cgst, sum(sgst) sgst, sum(igst) igst, sum(cess) cess, sum(cgst+sgst+igst+cess) tax
-    from doc_lines where ${W('sales')} group by hsn order by sum(taxable) desc`, p);
+    from doc_lines where ${W('sales', s)} group by hsn order by sum(taxable) desc`, p);
   const rates = await q(`select (cgst_pct+sgst_pct+igst_pct)::text rate, sum(taxable) taxable, sum(cgst) cgst, sum(sgst) sgst, sum(igst) igst, sum(cess) cess
-    from doc_lines where ${W('sales')} group by 1 order by 1`, p);
+    from doc_lines where ${W('sales', s)} group by 1 order by 1`, p);
   const noGstin = await one(`select count(distinct doc_no)::int invoices, coalesce(sum(taxable),0) taxable from doc_lines
-    where ${W('sales')} and upper(coalesce(party_type,''))='REGISTERED' and gstin is null`, p);
+    where ${W('sales', s)} and upper(coalesce(party_type,''))='REGISTERED' and gstin is null`, p);
   res.json({ sales, credit_note: cn, purchase, debit_note: dn, ...pos, hsn, rates, no_gstin: noGstin });
 }));
 
 // ---------- returns ----------
 reportsRouter.get('/returns', wrap(async (req, res) => {
-  const p = range(req);
-  const [cn, dn, sales] = await Promise.all([docTotals('credit_note', p), docTotals('debit_note', p), docTotals('sales', p)]);
+  const p = range(req), s = settleOf(req);
+  const [cn, dn, sales] = await Promise.all([docTotals('credit_note', p, s), docTotals('debit_note', p), docTotals('sales', p, s)]);
   const [cnList, cnTypes, cnBrands, dnBrands, dnSkus, dnList] = await Promise.all([
     q(`select doc_no, doc_date::text date, max(party_name) party, max(note_type) type, count(*)::int lines, sum(qty) qty, max(doc_value) value
-       from doc_lines where ${W('credit_note')} group by doc_no, doc_date order by doc_date, doc_no`, p),
+       from doc_lines where ${W('credit_note', s)} group by doc_no, doc_date order by doc_date, doc_no`, p),
     q(`select coalesce(note_type,'Not given') name, count(distinct doc_no)::int notes, sum(taxable) taxable, sum(cgst+sgst+igst+cess) tax
-       from doc_lines where ${W('credit_note')} group by 1 order by 3 desc`, p),
-    byBrand('credit_note', p),
+       from doc_lines where ${W('credit_note', s)} group by 1 order by 3 desc`, p),
+    byBrand('credit_note', p, 50, s),
     byBrand('debit_note', p),
     q(`select max(sku_name) name, sum(qty) qty, sum(taxable) taxable from doc_lines where ${W('debit_note')}
        group by sku_code order by sum(taxable) desc limit 15`, p),
@@ -221,6 +280,7 @@ const LOW_DAYS = 7, EXCESS_DAYS = 45, EXPIRY_DAYS = 60;
 
 reportsRouter.get('/stock', wrap(async (req, res) => {
   const org = req.user.org_id;
+  const s = settleOf(req) === 'settled' ? 'settled' : 'all';
   const span = await one(`select min(doc_date)::text first, max(doc_date)::text last from doc_lines where org_id=$1`, [org]);
   const lastStatement = (await one(`select max(as_on)::text d from stock_items where org_id=$1`, [org]))?.d;
   const latest = [span?.last, lastStatement].filter(Boolean).sort().at(-1) || null;
@@ -242,10 +302,10 @@ reportsRouter.get('/stock', wrap(async (req, res) => {
                 coalesce(sum(qty) filter (where doc_type='credit_note'), 0) returned_in,
                 coalesce(sum(qty) filter (where doc_type='sales'), 0) sold,
                 coalesce(sum(qty) filter (where doc_type='debit_note'), 0) returned_out
-         from doc_lines where org_id=$1 and doc_date <= $2 and ($3::date is null or doc_date > $3::date) group by sku_code),
+         from doc_lines where org_id=$1 and doc_date <= $2 and ($3::date is null or doc_date > $3::date)${LINES(s)} group by sku_code),
        s30 as (
          select sku_code, sum(qty) qty from doc_lines
-         where org_id=$1 and doc_type='sales' and doc_date > $2::date - 30 and doc_date <= $2 group by sku_code),
+         where org_id=$1 and doc_type='sales' and doc_date > $2::date - 30 and doc_date <= $2${LINES(s)} group by sku_code),
        pr as (
          select distinct on (sku_code) sku_code, taxable / nullif(qty, 0) rate from doc_lines
          where org_id=$1 and doc_type='purchase' and qty > 0 and doc_date <= $2 order by sku_code, doc_date desc),
@@ -290,7 +350,7 @@ reportsRouter.get('/stock', wrap(async (req, res) => {
   }, {})).map(b => ({ ...b, value: b.value.toFixed(2) })).sort((a, b) => b.value - a.value);
   const count = s => list.filter(i => i.status === s).length;
   res.json({
-    as_on: asOn, latest, first: span?.first || null, base, sales_days: days,
+    as_on: asOn, latest, first: span?.first || null, base, sales_days: days, settle: s,
     limits: { low: LOW_DAYS, excess: EXCESS_DAYS, expiry: EXPIRY_DAYS },
     summary: {
       value: sum(inStock, 'value').toFixed(2), unvalued: inStock.filter(i => i.value == null).length,
@@ -310,10 +370,11 @@ reportsRouter.get('/stock/item', wrap(async (req, res) => {
   const code = String(req.query.code || '');
   const asOn = ISO.test(req.query.as_on || '') ? req.query.as_on : null;
   if (!code || !asOn) throw new HttpError(400, 'Please choose an item.');
+  const s = settleOf(req) === 'settled' ? 'settled' : 'all';
   const base = (await one(`select max(as_on)::text d from stock_items where org_id=$1 and as_on <= $2`, [org, asOn]))?.d || null;
   const opening = base ? (await one(`select coalesce(sum(closing_qty),0) q from stock_items where org_id=$1 and as_on=$2 and sku_code=$3`, [org, base, code])).q : '0';
   const lines = await q(`select doc_date::text date, doc_type type, doc_no, party_name, party_code, sum(qty) qty, sum(taxable) taxable
-    from doc_lines where org_id=$1 and sku_code=$2 and doc_date <= $3 and ($4::date is null or doc_date > $4::date)
+    from doc_lines where org_id=$1 and sku_code=$2 and doc_date <= $3 and ($4::date is null or doc_date > $4::date)${LINES(s)}
     group by doc_date, doc_type, doc_no, party_name, party_code
     order by doc_date, case doc_type when 'purchase' then 1 when 'credit_note' then 2 when 'debit_note' then 3 else 4 end, doc_no
     limit 5000`, [org, code, asOn, base]);
@@ -330,13 +391,13 @@ reportsRouter.get('/stock/item', wrap(async (req, res) => {
 
 // In and out per item for the chosen dates, from the registers (works without a Stock Statement)
 reportsRouter.get('/stock/movement', wrap(async (req, res) => {
-  const p = range(req);
+  const p = range(req), s = settleOf(req);
   const items = await q(`select sku_code code, max(sku_name) name, max(brand) brand,
       coalesce(sum(qty) filter (where doc_type='purchase'),0) purchased,
       coalesce(sum(qty) filter (where doc_type='sales'),0) sold,
       coalesce(sum(qty) filter (where doc_type='credit_note'),0) returned_in,
       coalesce(sum(qty) filter (where doc_type='debit_note'),0) returned_out
-    from doc_lines where org_id=$1 and doc_date between $2 and $3 group by sku_code
+    from doc_lines where org_id=$1 and doc_date between $2 and $3${LINES(s)} group by sku_code
     order by sum(qty) filter (where doc_type='sales') desc nulls last limit 2000`, p);
   for (const i of items) i.net = String(Number((Number(i.purchased) + Number(i.returned_in) - Number(i.sold) - Number(i.returned_out)).toFixed(3)));
   res.json({ items });
@@ -348,18 +409,18 @@ reportsRouter.get('/outstanding', wrap(async (req, res) => {
   const snapshots = (await q(`select as_on::text d from outstanding_bills where org_id=$1 group by 1 order by 1 desc limit 60`, [org])).map(r => r.d);
   const asOn = ISO.test(req.query.as_on || '') ? req.query.as_on : await latestSnapshot(org, ISO.test(req.query.to || '') ? req.query.to : null) || snapshots[0];
   if (!asOn) return res.json({ snapshots, summary: null });
-  const p = [org, asOn];
+  const p = [org, asOn], s = settleOf(req), S = settleSql(s, 'outstanding_bills.bill_no');
   const [summary, salesmen, parties, oldest] = await Promise.all([
-    outstandingSummary(org, asOn),
+    outstandingSummary(org, asOn, s),
     q(`select salesman name, count(*)::int bills,
           coalesce(sum(balance) filter (where age_weeks <= 1),0) b1, coalesce(sum(balance) filter (where age_weeks between 2 and 4),0) b2,
           coalesce(sum(balance) filter (where age_weeks between 5 and 8),0) b3, coalesce(sum(balance) filter (where age_weeks between 9 and 12),0) b4,
           coalesce(sum(balance) filter (where age_weeks > 12),0) b5, sum(balance) total
-       from outstanding_bills where org_id=$1 and as_on=$2 group by 1 order by sum(balance) desc`, p),
+       from outstanding_bills where org_id=$1 and as_on=$2${S} group by 1 order by sum(balance) desc`, p),
     q(`select coalesce(party_code,'') code, max(party_name) name, max(salesman) salesman, count(*)::int bills, max(age_weeks) oldest, sum(balance) balance
-       from outstanding_bills where org_id=$1 and as_on=$2 group by coalesce(party_code, party_name), party_code order by sum(balance) desc limit 25`, p),
+       from outstanding_bills where org_id=$1 and as_on=$2${S} group by coalesce(party_code, party_name), party_code order by sum(balance) desc limit 25`, p),
     q(`select bill_date::text date, bill_no, party_name, salesman, age_weeks, balance from outstanding_bills
-       where org_id=$1 and as_on=$2 order by age_weeks desc, bill_date limit 20`, p),
+       where org_id=$1 and as_on=$2${S} order by age_weeks desc, bill_date limit 20`, p),
   ]);
   res.json({ snapshots, as_on: asOn, summary, salesmen, parties, oldest });
 }));
@@ -369,7 +430,7 @@ reportsRouter.get('/outstanding/salesman', wrap(async (req, res) => {
   const org = req.user.org_id;
   const asOn = ISO.test(req.query.as_on || '') ? req.query.as_on : await latestSnapshot(org);
   const bills = await q(`select bill_date::text date, bill_no, trn, party_name, party_code, bill_amount, received, balance, age_weeks
-    from outstanding_bills where org_id=$1 and as_on=$2 and salesman is not distinct from $3
+    from outstanding_bills where org_id=$1 and as_on=$2 and salesman is not distinct from $3${settleSql(settleOf(req), 'outstanding_bills.bill_no')}
     order by age_weeks desc, bill_date, bill_no limit 10000`, [org, asOn, req.query.name ?? null]);
   res.json({ as_on: asOn, bills });
 }));
@@ -380,7 +441,7 @@ reportsRouter.get('/outstanding/search', wrap(async (req, res) => {
   if (term.length < 2) return res.json({ bills: [] });
   const asOn = ISO.test(req.query.as_on || '') ? req.query.as_on : await latestSnapshot(req.user.org_id);
   const bills = await q(`select bill_date::text date, bill_no, party_name, party_code, salesman, bill_amount, received, balance, age_weeks
-    from outstanding_bills where org_id=$1 and as_on=$2 and (party_name ilike $3 or party_code ilike $3 or bill_no ilike $3)
+    from outstanding_bills where org_id=$1 and as_on=$2 and (party_name ilike $3 or party_code ilike $3 or bill_no ilike $3)${settleSql(settleOf(req), 'outstanding_bills.bill_no')}
     order by party_name, bill_date limit 300`, [req.user.org_id, asOn, '%' + term.replace(/[%_]/g, '') + '%']);
   res.json({ as_on: asOn, bills });
 }));
