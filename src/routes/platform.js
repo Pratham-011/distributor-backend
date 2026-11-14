@@ -9,6 +9,7 @@ import { logActivity } from '../activity.js';
 import { getSettings, saveSettings, DEFAULTS } from '../settings.js';
 import { STATE_NAME } from '../states.js';
 import { KINDS } from './requests.js';
+import { removeFile } from '../storage.js';
 
 export const platformRouter = Router();
 platformRouter.use(requireAuth, (req, _res, next) => next(req.user.platform_admin ? undefined : new HttpError(403, 'Only the platform admin can open this page.')));
@@ -304,6 +305,47 @@ platformRouter.post('/orgs/:id/resume', wrap(async (req, res) => {
   if (!o) throw new HttpError(404, 'Business not found.');
   await logActivity(req, 'business.resumed', 'Portal turned back on by the platform admin', {}, platformActor(req, o.id));
   res.json({ ok: true });
+}));
+
+// Deletes a business for good: its people and sign-ins, every upload and its original file in storage, all report data,
+// saved formats, payments, requests and its activity log. The admin must type the business name to confirm.
+// Its extra companies are not deleted: they are only unlinked. A line about the deletion goes into the admin's own activity log.
+platformRouter.delete('/orgs/:id', wrap(async (req, res) => {
+  const orgId = id(req);
+  if (orgId === req.user.org_id) throw new HttpError(400, 'You cannot delete your own business here.');
+  const o = await one(`select id, name from organizations where id=$1`, [orgId]);
+  if (!o) throw new HttpError(404, 'Business not found.');
+  if (String(req.body?.confirm ?? '').trim() !== o.name.trim()) throw new HttpError(400, `To confirm, type the business name exactly: ${o.name}`);
+  // with_companies: its extra companies are deleted too (the whole customer); otherwise they are only unlinked
+  const kids = await q(`select id, name from organizations where parent_org_id=$1 order by name`, [orgId]);
+  const withKids = req.body?.with_companies === true && kids.length > 0;
+  if (withKids && kids.some(k => k.id === req.user.org_id)) throw new HttpError(400, 'Your own business is one of its extra companies, so it cannot be deleted this way.');
+  const ids = [orgId, ...(withKids ? kids.map(k => k.id) : [])];
+  const [counts, files, emails] = await Promise.all([
+    one(`select (select count(*) from users where org_id = any($1::uuid[]))::int users, (select count(*) from uploads where org_id = any($1::uuid[]))::int uploads,
+           (select count(*) from doc_lines where org_id = any($1::uuid[]))::int doc_lines, (select count(*) from org_payments where org_id = any($1::uuid[]))::int payments`, [ids]),
+    q(`select storage_path from uploads where org_id = any($1::uuid[])`, [ids]),
+    q(`select distinct email from users where org_id = any($1::uuid[])`, [ids]),
+  ]);
+  // original files first: if storage refuses, the database is left as it was and the delete can simply be tried again
+  const failed = [];
+  for (const f of files) { try { await removeFile(f.storage_path); } catch (e) { failed.push(e.message); } }
+  if (failed.length) {
+    console.error(`[delete business] ${orgId}: ${failed.length} file(s) could not be removed: ${failed[0]}`);
+    throw new HttpError(502, `${failed.length} of ${files.length} stored file(s) could not be deleted, so nothing else was deleted. Please try again.`);
+  }
+  await db.tx(async t => {
+    await t.query(`delete from organizations where id = any($1::uuid[])`, [ids]);     // everything else of these businesses goes with them (on delete cascade)
+    // sign-up / reset codes of people who no longer belong to any business
+    await t.query(`delete from otps where email = any($1::text[]) and not exists (select 1 from users u where u.email = otps.email)`, [emails.map(e => e.email)]);
+  });
+  const names = withKids ? `"${o.name}" with its extra companies ${kids.map(k => `"${k.name}"`).join(', ')}` : `"${o.name}"`;
+  await logActivity(req, 'business.deleted',
+    `Deleted the business ${names} and all the data: ${counts.users} people, ${counts.uploads} uploads (and their files), ${counts.doc_lines} bill lines, ${counts.payments} payments` +
+      (!withKids && kids.length ? `. Its extra companies were unlinked, not deleted: ${kids.map(k => k.name).join(', ')}` : ''),
+    { org_ids: ids, name: o.name, ...counts }, platformActor(req, req.user.org_id));
+  res.json({ ok: true, deleted: { name: o.name, businesses: ids.length, ...counts, files: files.length },
+    companies_deleted: withKids ? kids.map(k => k.name) : [], unlinked: withKids ? [] : kids.map(k => k.name) });
 }));
 
 // every payment from every business, newest first (the revenue side of the money tab)
