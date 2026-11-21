@@ -34,6 +34,67 @@ const LINES = s => (s === 'all' ? '' : ` and (doc_lines.doc_type in ('purchase',
   or (doc_lines.doc_type='sales' and ${IS_SETTLED('doc_lines.doc_no')} is ${s === 'settled' ? '' : 'not '}true)
   or (doc_lines.doc_type='credit_note' and ${IS_SETTLED('doc_lines.ref_no')} is ${s === 'settled' ? '' : 'not '}true))`);
 
+// Money received on the chosen dates ($1 org, $2 from, $3 to), one row per bill paid:
+//  - the Daily Sales Collection Report (a receipt line that is in two uploaded files counts once), split by bill number
+//  - the cash taken at delivery (Delivery Report Collection; those bills are settled by definition). Cheques taken at delivery
+//    are NOT counted from there: the same cheque is entered again in the Daily Sales Collection Report, which is counted.
+const MONEY = s => `money as (
+    select c.rec_no v_no, c.coll_date d, c.party_name, c.party_code, coalesce(c.salesman, 'Not given') collected_by, c.mode,
+           c.bank, c.cheque_no, c.cheque_date, c.received amount, c.bill_no, c.bill_key
+    from (select distinct on (rec_no, bill_key) * from collections where org_id=$1 and coll_date between $2 and $3
+          order by rec_no, bill_key, id desc) c
+    where c.received <> 0${settleSql(s, 'c.bill_key')}
+    union all
+    select 'Load ' || coalesce(sb.load_no, '-'), sb.settled_on, sb.party_name, null::text, 'At delivery', m.mode,
+           null::text, null::text, null::date, m.amount, sb.bill_no, sb.bill_key
+    from (select distinct on (bill_key) * from settled_bills where org_id=$1 and settled_on between $2 and $3
+          order by bill_key, settled_on desc, id desc) sb
+    cross join lateral (values ('Cash', sb.cash)) m(mode, amount)
+    where m.amount > 0${s === 'unsettled' ? ' and false' : ''})`;
+
+/**
+ * Settled bills (delivered up to asOn) that still have money to collect:
+ * bill amount − cash taken at delivery − cheques − everything else collected since (cash, RTGS, discount, returns).
+ * Cheques: a cheque taken at delivery is entered again in the Daily Sales Collection Report, so the larger of the two
+ * counts (never both): a bill whose delivery cheque is not yet in an uploaded collection report is still paid.
+ * The salesman is the one who collected on the bill last, else the one in the latest Outstanding statement.
+ * Only settled bills have this information, so "unsettled" has nothing to show.
+ */
+async function leftToCollect(org, asOn, s) {
+  if (s === 'unsettled') return null;
+  const PAID = `(greatest(sb.cheque, coalesce(c.cheques, 0)) + coalesce(c.others, 0))`;
+  return q(`
+    with sb as (
+      select distinct on (bill_key) bill_key, bill_no, series, party_name, bill_amount, cash, cheque, settled_on, load_no
+      from settled_bills where org_id=$1 and settled_on <= $2 order by bill_key, settled_on desc, id desc),
+    c as (
+      select bill_key, max(coll_date) last_paid,
+             coalesce(sum(received) filter (where mode = 'Cheque'), 0) cheques,
+             coalesce(sum(received) filter (where mode <> 'Cheque'), 0) + sum(discount + returned) others,
+             (array_agg(salesman order by coll_date desc, id desc))[1] salesman
+      from (select distinct on (rec_no, bill_key) * from collections where org_id=$1 and coll_date <= $2
+            order by rec_no, bill_key, id desc) x group by bill_key),
+    o as (   -- the latest Outstanding statement: its salesman for the bill, and its balance to compare with
+      select ${KEY('bill_no')} k, max(salesman) salesman, sum(balance) balance from outstanding_bills
+      where org_id=$1 and as_on = (select max(as_on) from outstanding_bills where org_id=$1) group by 1)
+    select sb.bill_key, sb.bill_no, sb.series, sb.party_name, sb.bill_amount, sb.cash, sb.cheque, sb.settled_on::text settled_on, sb.load_no,
+           ${PAID} paid, c.last_paid::text last_paid, coalesce(c.salesman, o.salesman, 'Not known') salesman, o.balance statement_balance,
+           sb.bill_amount - sb.cash - ${PAID} left_amt, ($2::date - sb.settled_on) days
+    from sb left join c on c.bill_key = sb.bill_key left join o on o.k = sb.bill_key
+    where sb.bill_amount - sb.cash - ${PAID} >= 1
+    order by sb.settled_on, sb.bill_key`, [org, asOn]);
+}
+const leftBySalesman = rows => {
+  const m = new Map();
+  for (const r of rows) {
+    const x = m.get(r.salesman) || { name: r.salesman, bills: 0, bill_amount: 0, received: 0, left: 0 };
+    x.bills++; x.bill_amount += Number(r.bill_amount); x.received += Number(r.cash) + Number(r.paid); x.left += Number(r.left_amt);
+    m.set(r.salesman, x);
+  }
+  return [...m.values()].map(x => ({ ...x, bill_amount: x.bill_amount.toFixed(2), received: x.received.toFixed(2), left: x.left.toFixed(2) }))
+    .sort((a, b) => b.left - a.left);
+};
+
 // Common WHERE for a doc type in a date range: $1 org, $2 from, $3 to.
 // A credit note follows the bill it was raised against (Ref. Inv No); purchases and debit notes are always counted.
 const W = (type, s = 'all') => `org_id=$1 and doc_type='${type}' and doc_date between $2 and $3` +
@@ -85,10 +146,10 @@ reportsRouter.get('/dates', wrap(async (req, res) => {
   const org = req.user.org_id;
   const rows = await q(`
     select doc_type t, doc_date::text d from doc_lines where org_id=$1 group by 1,2
-    union all select 'receipt', v_date::text from receipts where org_id=$1 group by 2
     union all select 'outstanding', as_on::text from outstanding_bills where org_id=$1 group by 2
     union all select 'stock', as_on::text from stock_items where org_id=$1 group by 2
     union all select 'delivery', settled_on::text from settled_bills where org_id=$1 group by 2
+    union all select 'collection', coll_date::text from collections where org_id=$1 group by 2
     order by 2 desc`, [org]);
   const latest = {};
   const days = {};
@@ -103,15 +164,14 @@ reportsRouter.get('/dates', wrap(async (req, res) => {
 reportsRouter.get('/overview', wrap(async (req, res) => {
   const p = range(req), s = settleOf(req);
   const [sales, cn, purchase, dn] = await Promise.all(['sales', 'credit_note', 'purchase', 'debit_note'].map(t => docTotals(t, p, s)));
-  const receipts = await one(`select count(*)::int n, coalesce(sum(amount),0) total,
-      coalesce(sum(amount) filter (where mode='Cash'),0) cash, coalesce(sum(amount) filter (where mode<>'Cash'),0) bank
-    from receipts where org_id=$1 and v_date between $2 and $3`, p);
+  const receipts = await one(`with ${MONEY(s)} select count(*)::int n, coalesce(sum(amount),0) total,
+      coalesce(sum(amount) filter (where mode='Cash'),0) cash, coalesce(sum(amount) filter (where mode<>'Cash'),0) bank from money`, p);
   const asOn = await latestSnapshot(p[0], p[2]) || await latestSnapshot(p[0]);   // outstanding is a position: show the nearest one we have
-  const daily = await q(`
-    select d::text date, coalesce(s.taxable,0) sales, coalesce(r.amount,0) collected from
-      (select doc_date d from doc_lines where ${W('sales', s)} union select v_date from receipts where org_id=$1 and v_date between $2 and $3) days
+  const daily = await q(`with ${MONEY(s)}
+    select days.d::text date, coalesce(s.taxable,0) sales, coalesce(r.amount,0) collected from
+      (select doc_date d from doc_lines where ${W('sales', s)} union select d from money) days
       left join (select doc_date, sum(taxable) taxable from doc_lines where ${W('sales', s)} group by 1) s on s.doc_date=days.d
-      left join (select v_date, sum(amount) amount from receipts where org_id=$1 and v_date between $2 and $3 group by 1) r on r.v_date=days.d
+      left join (select d, sum(amount) amount from money group by 1) r on r.d=days.d
     order by 1`, p);
   res.json({
     sales, credit_note: cn, purchase, debit_note: dn, receipts,
@@ -230,43 +290,53 @@ reportsRouter.get('/purchases', wrap(async (req, res) => {
   res.json({ totals, bills, brands });
 }));
 
-// ---------- collections ----------
-// Cash / Cheque / Online split, as columns of a grouped query
+// ---------- money received ----------
+// From the Daily Sales Collection Report and the cash / cheques taken at delivery (see MONEY), split by salesman and by shop
+// into Cash / Cheque / Online (RTGS), plus what is still left to collect on settled bills.
 const SPLIT = `count(*)::int n, sum(amount) amount,
   coalesce(sum(amount) filter (where mode='Cash'),0) cash, count(*) filter (where mode='Cash')::int cash_n,
   coalesce(sum(amount) filter (where mode='Cheque'),0) cheque, count(*) filter (where mode='Cheque')::int cheque_n,
   coalesce(sum(amount) filter (where mode='Online'),0) online, count(*) filter (where mode='Online')::int online_n`;
 
 reportsRouter.get('/collections', wrap(async (req, res) => {
-  const p = range(req);
-  const R = `org_id=$1 and v_date between $2 and $3`;
-  const [totals, modes, people, parties, cheques, accounts, daily] = await Promise.all([
-    one(`select count(*)::int n, coalesce(sum(amount),0) total from receipts where ${R}`, p),
-    q(`select mode name, count(*)::int n, sum(amount) amount from receipts where ${R} group by 1 order by 3 desc`, p),
-    q(`select collected_by key, collected_by name, ${SPLIT} from receipts where ${R} group by 1 order by sum(amount) desc`, p),
-    q(`select coalesce(party_code, party_name) key, max(party_name) name, max(party_code) code, max(city) city, ${SPLIT}
-       from receipts where ${R} group by 1 order by sum(amount) desc limit 50`, p),
-    q(`select v_no, v_date::text date, party_name, bank, cheque_no, cheque_date::text cheque_date, amount from receipts
-       where ${R} and mode='Cheque' order by cheque_date nulls last, v_no`, p),
-    q(`select account name, count(*)::int n, sum(amount) amount from receipts where ${R} group by 1 order by 3 desc`, p),
-    q(`select v_date::text date, sum(amount) amount, count(*)::int n from receipts where ${R} group by 1 order by 1`, p),
+  const p = range(req), s = settleOf(req);
+  const M = `with ${MONEY(s)}`;
+  const [totals, modes, people, parties, daily, files, left] = await Promise.all([
+    one(`${M} select count(*)::int n, count(distinct bill_key)::int bills, coalesce(sum(amount),0) total from money`, p),
+    q(`${M} select mode name, count(*)::int n, sum(amount) amount from money group by 1 order by 3 desc`, p),
+    q(`${M} select collected_by key, collected_by name, ${SPLIT} from money group by 1
+       order by (collected_by = 'At delivery') desc, sum(amount) desc`, p),
+    q(`${M} select coalesce(party_code, party_name) key, max(party_name) name, max(party_code) code, ${SPLIT}
+       from money group by 1 order by sum(amount) desc limit 50`, p),
+    q(`${M} select d::text date, sum(amount) amount, count(*)::int n from money group by 1 order by 1`, p),
+    one(`select (select count(*) from collections where org_id=$1)::int lines, (select max(coll_date)::text from collections where org_id=$1) latest`, [p[0]]),
+    leftToCollect(p[0], p[2], s),
   ]);
-  const chequeTotal = (await one(`select coalesce(sum(amount),0) v from receipts where ${R} and mode='Cheque'`, p)).v;
-  res.json({ totals, modes, people, parties, cheques, cheque_total: chequeTotal, accounts, daily });
+  res.json({ totals, modes, people, parties, daily, has_files: files.lines > 0, latest: files.latest,
+    left: left && { as_on: p[2], bills: left.length, total: left.reduce((x, r) => x + Number(r.left_amt), 0).toFixed(2), by_salesman: leftBySalesman(left) } });
 }));
 
-// Receipts for the chosen dates: every one (no `by`), or those behind one row of
-// "Collected by" (by=person) or "Shops" (by=party)
+// Every payment for the chosen dates: all of them (no `by`), or those behind one salesman (by=person) or shop (by=party)
 reportsRouter.get('/collections/receipts', wrap(async (req, res) => {
-  const p = range(req);
+  const p = range(req), s = settleOf(req);
   const key = String(req.query.key ?? '');
   const col = { person: 'collected_by', party: 'coalesce(party_code, party_name)' }[req.query.by];
-  if (req.query.by && (!col || !key)) throw new HttpError(400, 'Please choose a person or a shop.');
-  const receipts = await q(`select v_no, v_date::text date, party_name, party_code, city, collected_by, mode, account, bank, cheque_no,
-      cheque_date::text cheque_date, amount
-    from receipts where org_id=$1 and v_date between $2 and $3 ${col ? `and ${col} = $4` : ''}
-    order by ${col ? `case mode when 'Cash' then 1 when 'Cheque' then 2 else 3 end, ` : ''}v_date, v_no limit 10000`, col ? [...p, key] : p);
+  if (req.query.by && (!col || !key)) throw new HttpError(400, 'Please choose a salesman or a shop.');
+  const receipts = await q(`with ${MONEY(s)}
+    select v_no, d::text date, party_name, party_code, null city, collected_by, mode, null account, bank, cheque_no,
+           cheque_date::text cheque_date, amount, bill_no
+    from money ${col ? `where ${col} = $4` : ''}
+    order by ${col ? `case mode when 'Cash' then 1 when 'Cheque' then 2 else 3 end, ` : ''}d, v_no limit 10000`, col ? [...p, key] : p);
   res.json({ receipts });
+}));
+
+// Settled bills still to be collected (as on the last chosen day), optionally for one salesman
+reportsRouter.get('/collections/left', wrap(async (req, res) => {
+  const p = range(req), s = settleOf(req);
+  const rows = await leftToCollect(p[0], p[2], s) || [];
+  const who = req.query.salesman;
+  const statement = (await one(`select max(as_on)::text d from outstanding_bills where org_id=$1`, [p[0]]))?.d || null;
+  res.json({ as_on: p[2], statement_as_on: statement, bills: who === undefined ? rows : rows.filter(r => r.salesman === who) });
 }));
 
 // ---------- stock ----------

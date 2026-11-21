@@ -152,7 +152,7 @@ ok(undo.ok && !undo.restored.length, 'undoing a load removes only its own bills'
 sales = await split('/reports/sales');
 ok(sales.settled.totals.docs === 7 && sales.unsettled.totals.docs === 7, '9003 and A104 are unsettled again; load 1 is untouched');
 
-console.log('Other businesses, purchases and receipts');
+console.log('Other businesses and purchases');
 const H2 = await account('Beta');
 await upload(H2, 'GST Sales Register 02-11-26.xlsx', xlsx(salesRows));
 const beta = await get(H2, `/reports/sales${R}&settle=settled`);
@@ -162,9 +162,6 @@ await upload(H, 'purchase.xlsx', fs.readFileSync(`${fx}/purchase.xlsx`));
 const P = '?from=2026-09-01&to=2026-10-31';
 const [pa, ps] = [await get(H, '/reports/purchases' + P), await get(H, '/reports/purchases' + P + '&settle=settled')];
 ok(pa.totals.docs > 0 && JSON.stringify(pa) === JSON.stringify(ps), 'purchases are never split: the filter changes nothing there');
-await upload(H, 'receipts.xlsx', fs.readFileSync(`${fx}/receipts.xlsx`));
-const [ra, rs] = [await get(H, '/reports/collections' + P), await get(H, '/reports/collections' + P + '&settle=unsettled')];
-ok(Number(ra.totals.total) > 0 && JSON.stringify(ra) === JSON.stringify(rs), 'receipts are not split either');
 ok((await get(H, `/reports/sales${R}&settle=banana`)).totals.docs === 14, 'an unknown filter value just shows every bill');
 
 console.log(fails ? `\n${fails} FAILED` : '\nall passed');

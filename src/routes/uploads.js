@@ -103,6 +103,9 @@ async function analyse(orgId, buffer, fileName, opts = {}) {
   const banner = bannerOf(grid, headerRow);
   const headers = headersOf(grid, headerRow);
   const type = opts.report_type || detectType(banner, headers);
+  if (REPORT_TYPES[type]?.hidden) {
+    throw new HttpError(400, `The ${REPORT_TYPES[type].label} is no longer used. Money received now comes from the Daily Sales Collection Report and the Delivery Report Collection: please upload those instead.`);
+  }
   const period = periodOf(banner);
   const body = bodyOf(grid, headerRow, headers);
   const hash = sha256(buffer);
@@ -190,7 +193,7 @@ uploadsRouter.post('/preview/:token', requireRole('writer'), wrap(async (req, re
 uploadsRouter.post('/commit', requireRole('writer'), wrap(async (req, res) => {
   const { token, report_type, header_row, mapping, date_format = 'DMY', save_template = true, template_name } = req.body;
   const T = REPORT_TYPES[report_type];
-  if (!T) throw new HttpError(400, 'Please choose what kind of file this is.');
+  if (!T || T.hidden) throw new HttpError(400, 'Please choose what kind of file this is.');
   const { meta, buffer } = await loadTmp(req.user.org_id, token);
   // the whole save holds the file's rows in memory, so it takes its turn in the line like a check
   return inLine(jobIdOf(req), () => commitFile(req, res, { token, report_type, header_row, mapping, date_format, save_template, template_name, T, meta, buffer }));
@@ -318,6 +321,13 @@ async function insertRows(t, T, orgId, uploadId, type, r) {
       party_name: x.party_name ?? null, bill_amount: x.bill_amount ?? '0', cash: x.cash ?? '0', cheque: x.cheque ?? '0', credit: x.credit ?? '0',
       pending: x.pending ?? '0', scheme: x.scheme ?? '0', cd: x.cd ?? '0', load_no: x.load_no ?? null, settled_on: r.period.to,
     })), 500);
+  } else if (type === 'collection') {
+    await bulkInsert(t, 'collections', r.rows.map(x => ({
+      org_id: orgId, upload_id: uploadId, row_no: x.row_no, coll_date: r.period.to, salesman: x.salesman ?? null, salesman_code: x.salesman_code ?? null,
+      rec_no: x.rec_no, party_name: x.party_name ?? null, party_code: x.party_code ?? null, bill_no: x.bill_no, bill_key: x.bill_key, bill_date: x.bill_date ?? null,
+      bill_amount: x.bill_amount ?? '0', prev_received: x.prev_received ?? '0', received: x.received ?? '0', discount: x.discount ?? '0', balance: x.balance ?? '0',
+      returned: x.returned ?? '0', mode: x.mode, cheque_no: x.cheque_no ?? null, cheque_date: x.cheque_date ?? null, bank: x.bank ?? null,
+    })), 500);
   } else if (type === 'receipt') {
     await bulkInsert(t, 'receipts', r.rows.map(x => ({
       org_id: orgId, upload_id: uploadId, row_no: x.row_no, v_date: x.v_date, v_no: x.v_no, party_code: x.party_code ?? null,
@@ -370,7 +380,7 @@ uploadsRouter.get('/:id/download', wrap(async (req, res) => {
 // stored original file. Days that a later upload has since taken over are left alone.
 // The undone upload's own file is kept, so it can still be downloaded.
 
-const ROW_DATE = { doc_lines: 'doc_date', receipts: 'v_date', outstanding_bills: 'as_on', stock_items: 'as_on', settled_bills: 'settled_on' };
+const ROW_DATE = { doc_lines: 'doc_date', receipts: 'v_date', outstanding_bills: 'as_on', stock_items: 'as_on', settled_bills: 'settled_on', collections: 'coll_date' };
 
 function daysOf(from, to) {
   const out = [];

@@ -347,6 +347,38 @@ create table if not exists settled_bills (
 create index if not exists settled_bills_key on settled_bills (org_id, bill_key);
 create index if not exists settled_bills_upload on settled_bills (upload_id);
 
+-- ---- money collected against bills (from the Daily Sales Collection Report) ----
+-- One row per bill in a receipt. mode: Cash (no cheque number) | Cheque | Online (RTGS / NEFT / UPI ...).
+-- Files add up; a receipt line repeated in another file (same receipt number + bill) is counted once by the reports.
+create table if not exists collections (
+  id            bigserial primary key,
+  org_id        uuid not null references organizations(id) on delete cascade,
+  upload_id     uuid not null references uploads(id) on delete cascade,
+  row_no        int not null,
+  coll_date     date not null,
+  salesman      text,
+  salesman_code text,
+  rec_no        text not null,
+  party_name    text,
+  party_code    text,
+  bill_no       text not null,
+  bill_key      text not null,
+  bill_date     date,
+  bill_amount   numeric(14,2) not null default 0,
+  prev_received numeric(14,2) not null default 0,
+  received      numeric(14,2) not null default 0,
+  discount      numeric(14,2) not null default 0,
+  balance       numeric(14,2) not null default 0,
+  returned      numeric(14,2) not null default 0,
+  mode          text not null,
+  cheque_no     text,
+  cheque_date   date,
+  bank          text
+);
+create index if not exists collections_q on collections (org_id, coll_date);
+create index if not exists collections_key on collections (org_id, bill_key);
+create index if not exists collections_upload on collections (upload_id);
+
 -- The app talks to Postgres directly from the server. Turning on row level security with no policies
 -- blocks Supabase's public REST API (anon / authenticated keys) from reading these tables at all.
 alter table organizations     enable row level security;
@@ -367,3 +399,4 @@ alter table platform_settings enable row level security;
 alter table platform_expenses enable row level security;
 alter table requests          enable row level security;
 alter table settled_bills     enable row level security;
+alter table collections       enable row level security;

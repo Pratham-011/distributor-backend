@@ -67,8 +67,10 @@ export const REPORT_TYPES = {
       { key: 'ref_date', label: 'Original bill date', kind: 'date', match: ['refinvdate'] },
     ],
   },
+  // No longer used (money received now comes from the Daily Sales Collection Report). Kept so earlier uploads can still be
+  // listed, undone and deleted; it can't be chosen or uploaded any more.
   receipt: {
-    key: 'receipt', label: 'Receipt Book', short: 'Receipts', table: 'receipts',
+    key: 'receipt', label: 'Receipt Book', short: 'Receipts', table: 'receipts', hidden: true,
     titles: ['receipt book', 'receipt register'],
     fields: [
       { key: 'v_date', label: 'Receipt date', kind: 'date', required: true, match: ['voucherdate', 'vdate', 'date'] },
@@ -122,6 +124,38 @@ export const REPORT_TYPES = {
       { key: 'cd', label: 'Cash discount (CD)', kind: 'money', match: ['cd'] },
     ],
   },
+  // Daily Sales Collection Report: money collected against bills, grouped under "Salesman Name : MURALI [107]" lines.
+  // An empty cheque number means cash; "RTGS" (or NEFT, UPI ...) means paid online; anything else is a cheque.
+  // Files add up (a cash file and a cheque file for the same day).
+  collection: {
+    key: 'collection', label: 'Daily Sales Collection Report', short: 'Collections', table: 'collections', additive: true,
+    titles: ['daily sales collection report', 'sales collection report'],
+    // the salesman heading applies to the rows under it; an empty party means the same party as the row above
+    carry: (rec, st) => {
+      const m = String(rec.rec_no || '').match(/^\s*salesman\s*name\s*:?\s*(.*?)\s*(?:\[([^\]]*)\])?\s*$/i);
+      if (m) { st.salesman = m[1] || null; st.code = m[2] || null; st.party = null; return false; }
+      rec.salesman = st.salesman ?? null;
+      rec.salesman_code = st.code ?? null;
+      if (!rec.party_name) rec.party_name = st.party ?? null; else st.party = rec.party_name;
+      return true;
+    },
+    keepRow: rec => !!rec.bill_no && /\d/.test(String(rec.rec_no || '')),
+    fields: [
+      { key: 'bill_no', label: 'Bill number', kind: 'text', required: true, match: ['billno'] },
+      { key: 'rec_no', label: 'Receipt number', kind: 'text', required: true, match: ['recno', 'receiptno'] },
+      { key: 'party_name', label: 'Party', kind: 'text', match: ['party', 'partyname'] },
+      { key: 'bill_date', label: 'Bill date', kind: 'date', match: ['billdate'] },
+      { key: 'bill_amount', label: 'Bill amount', kind: 'money', match: ['billamt', 'billamount'] },
+      { key: 'prev_received', label: 'Received earlier', kind: 'money', match: ['prevrecamt', 'prevreceived'] },
+      { key: 'received', label: 'Amount received', kind: 'money', required: true, match: ['recievedamt', 'receivedamt', 'received'] },
+      { key: 'discount', label: 'Discount', kind: 'money', match: ['discamt', 'discount'] },
+      { key: 'balance', label: 'Balance left', kind: 'money', match: ['balamt', 'balance'] },
+      { key: 'cheque_no', label: 'Cheque no. / RTGS (empty = cash)', kind: 'text', match: ['chqno', 'chequeno'] },
+      { key: 'cheque_date', label: 'Cheque date', kind: 'date', match: ['chqdate', 'chequedate'] },
+      { key: 'returned', label: 'Returned amount', kind: 'money', match: ['retamt', 'returned'] },
+      { key: 'bank', label: 'Bank', kind: 'text', match: ['bankname', 'bank'] },
+    ],
+  },
   // Closing stock / stock summary, "as on" a date (like Outstanding). Batch-wise files are fine: rows are added up per item.
   stock: {
     key: 'stock', label: 'Stock Statement', short: 'Stock', table: 'stock_items', snapshot: true,
@@ -144,7 +178,8 @@ export const REPORT_TYPES = {
 };
 export const SNAPSHOT_TYPES = Object.values(REPORT_TYPES).filter(t => t.snapshot || t.key === 'outstanding').map(t => t.key);
 
-export const TYPE_LIST = Object.values(REPORT_TYPES).map(t => ({ key: t.key, label: t.label, short: t.short }));
+// the kinds of file people can choose (hidden ones only exist for earlier uploads)
+export const TYPE_LIST = Object.values(REPORT_TYPES).filter(t => !t.hidden).map(t => ({ key: t.key, label: t.label, short: t.short }));
 
 export const norm = s => String(s ?? '').toLowerCase().replace(/[^a-z0-9%]/g, '').replace(/%/g, '');
 

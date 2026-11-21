@@ -69,6 +69,7 @@ export function detectType(banner, headers) {
   if (h.has('billno') && h.has('series') && h.has('cash') && h.has('cheque') && h.has('credit') && h.has('partyname')) return 'delivery';
   if (h.has('crntype')) return 'credit_note';
   if (h.has('creditaccount') && h.has('debitaccount')) return 'receipt';
+  if (h.has('recno') && h.has('billno') && (h.has('recievedamt') || h.has('receivedamt'))) return 'collection';
   if (h.has('balance') && h.has('billamount')) return 'outstanding';
   if (h.has('suppliername') && h.has('refinvno')) return 'debit_note';
   if (h.has('suppliername') && h.has('vno')) return 'purchase';
@@ -82,6 +83,9 @@ export function periodOf(banner) {
   let m = text.match(/From\s*:?\s*(\d{1,2})[/-](\d{1,2})[/-](\d{4})\s*To\s*:?\s*(\d{1,2})[/-](\d{1,2})[/-](\d{4})/i);
   if (m) return { from: `${m[3]}-${pad(m[2])}-${pad(m[1])}`, to: `${m[6]}-${pad(m[5])}-${pad(m[4])}` };
   m = text.match(/As\s*On\s*(?:Date)?\s*:?\s*(\d{1,2})[/-](\d{1,2})[/-](\d{4})/i);
+  if (m) { const d = `${m[3]}-${pad(m[2])}-${pad(m[1])}`; return { from: d, to: d }; }
+  // Daily Sales Collection Report: "For Date : 13/11/2026"
+  m = text.match(/For\s*Date\s*:?\s*(\d{1,2})[/-](\d{1,2})[/-](\d{4})/i);
   if (m) { const d = `${m[3]}-${pad(m[2])}-${pad(m[1])}`; return { from: d, to: d }; }
   // Delivery Report Collection: "Load No: 1554   Date : 12/11/2026" (and more load lines, each with a date)
   const loads = [...text.matchAll(/load\s*no\s*:?\s*\d+[^|]*?date\s*:?\s*(\d{1,2})[/-](\d{1,2})[/-](\d{4})/gi)]

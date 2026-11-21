@@ -34,7 +34,7 @@ const alpha = await signup('owner@alpha.test', 'Alpha Traders');
 const beta = await signup('owner@beta.test', 'Beta Stores');
 
 console.log('A business with something in every table');
-for (const f of ['sales.xlsx', 'purchase.xlsx', 'receipts.xlsx', 'outstanding.xlsx', 'stock.xlsx']) ok((await upload(alpha, f)).upload, `Alpha uploads ${f}`);
+for (const f of ['sales.xlsx', 'purchase.xlsx', 'credit_note.xlsx', 'outstanding.xlsx', 'stock.xlsx']) ok((await upload(alpha, f)).upload, `Alpha uploads ${f}`);
 await upload(beta, 'sales.xlsx');
 await call('POST', '/users/invite', { email: 'clerk@alpha.test', role: 'viewer' }, alpha);
 await call('POST', '/users/invite', { email: 'owner@beta.test', role: 'viewer' }, alpha);             // Beta's owner also works in Alpha

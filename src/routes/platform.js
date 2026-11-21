@@ -22,7 +22,7 @@ export const PERIOD_MONTHS = { monthly: 1, quarterly: 3, half_yearly: 6, yearly:
 const ONLINE_MIN = 5;
 const IDLE_HOURS = Number(process.env.SESSION_IDLE_HOURS) || 8;
 // tables that hold a business's data; size per business = the exact stored size of its rows
-const DATA_TABLES = ['doc_lines', 'receipts', 'outstanding_bills', 'stock_items', 'uploads', 'mapping_templates', 'activity_log', 'usage_blocks', 'org_payments', 'sessions', 'settled_bills'];
+const DATA_TABLES = ['doc_lines', 'receipts', 'outstanding_bills', 'stock_items', 'uploads', 'mapping_templates', 'activity_log', 'usage_blocks', 'org_payments', 'sessions', 'settled_bills', 'collections'];
 const PAYMENT_KINDS = ['setup', 'subscription', 'extra_user', 'extra_company', 'other'];
 const EXPENSE_CATEGORIES = ['hosting', 'database', 'domain', 'email', 'support', 'marketing', 'tools', 'salary', 'other'];
 
@@ -127,7 +127,7 @@ platformRouter.get('/orgs/:id', wrap(async (req, res) => {
   for (const u of users) { u.signed_in = u.device != null; u.device = u.device != null ? deviceOf(u.device) : null; }
   for (const s of sessions) { s.device = deviceOf(s.user_agent); delete s.user_agent; }
   const LABEL = { doc_lines: 'Sales, purchase and note lines', receipts: 'Receipts', outstanding_bills: 'Outstanding bills', stock_items: 'Stock statement rows',
-    uploads: 'Uploaded files (records)', mapping_templates: 'Saved file formats', activity_log: 'Activity log', usage_blocks: 'Usage records', org_payments: 'Payments', sessions: 'Sign-in records', settled_bills: 'Settled bills' };
+    uploads: 'Uploaded files (records)', mapping_templates: 'Saved file formats', activity_log: 'Activity log', usage_blocks: 'Usage records', org_payments: 'Payments', sessions: 'Sign-in records', settled_bills: 'Settled bills', collections: 'Collection lines' };
   const c = counts[orgId] || {};
   const data = DATA_TABLES.map(t => ({ name: LABEL[t], rows: c[t]?.n || 0, bytes: c[t]?.b || 0 })).filter(x => x.rows);
   res.json({ users, payments, data, daily, linked, sessions });
@@ -164,6 +164,19 @@ platformRouter.post('/orgs/:id/users/:uid/signout', wrap(async (req, res) => {
   await revokeUserSessions(u.id, 'admin');
   await logActivity(req, 'team.signed_out', `Signed ${u.name} (${u.email}) out of their device (platform admin)`, { user_id: u.id }, platformActor(req, orgId));
   res.json({ ok: true });
+}));
+
+// Signs every person of the business out of every device at once. They can log in again straight away
+// (to keep them out, pause the portal). Sign-ins of the same people in their other businesses are not touched.
+platformRouter.post('/orgs/:id/signout-all', wrap(async (req, res) => {
+  const orgId = id(req);
+  if (orgId === req.user.org_id) throw new HttpError(400, 'This is your own business: you would sign yourself out too. Sign people out one by one instead.');
+  const o = await one(`select name from organizations where id=$1`, [orgId]);
+  if (!o) throw new HttpError(404, 'Business not found.');
+  const r = await one(`with s as (update sessions set revoked_at=now(), revoked_why='admin' where org_id=$1 and revoked_at is null returning user_id)
+    select count(*)::int sessions, count(distinct user_id)::int people from s`, [orgId]);
+  await logActivity(req, 'team.signed_out', `Signed everyone out of their devices (platform admin): ${r.people} people, ${r.sessions} sign-ins`, r, platformActor(req, orgId));
+  res.json({ ok: true, ...r });
 }));
 
 // ---------------------------------------------------------------- subscription, seats, companies
